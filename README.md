@@ -2,6 +2,8 @@
 
 轻量美观的 Windows Markdown 查看器。单文件便携，无需安装。
 
+**[下载最新版本](https://gitee.com/jimyliu/md-viewer/releases/latest)**
+
 ## 功能特性
 
 - **即时预览** — 双击 `.md` 文件即可查看渲染效果
