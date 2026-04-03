@@ -1,0 +1,7 @@
+/target
+*.exe
+*.exe.WebView2/
+debug_html*.txt
+1.png
+test.md
+test_img.md
