@@ -1,3 +1,5 @@
+[English](README_EN.md) | **中文**
+
 # MD Viewer
 
 轻量美观的 Windows Markdown 查看器。单文件便携，无需安装。
