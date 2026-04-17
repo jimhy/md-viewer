@@ -771,9 +771,131 @@ body {{
 
 .content-area {{
   flex: 1;
+  display: flex;
+  min-height: 0;
+  margin: 0 8px 8px 8px;
+  position: relative;
+}}
+
+/* ===== TOC Sidebar ===== */
+.toc-sidebar {{
+  position: relative;
+  width: 240px;
+  min-width: 180px;
+  max-width: 480px;
+  flex-shrink: 0;
+  background: var(--block-bg);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}}
+.toc-sidebar.collapsed {{ display: none; }}
+.toc-header {{
+  padding: 14px 16px 8px;
+  font-size: 11px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-secondary);
+  flex-shrink: 0;
+}}
+.toc-content {{
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px 16px;
+}}
+.toc-list {{ list-style: none; padding: 0; margin: 0; }}
+.toc-list li {{ margin: 0; }}
+.toc-link {{
+  display: block;
+  padding: 4px 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--fg-secondary);
+  text-decoration: none;
+  border-left: 2px solid transparent;
+  border-radius: 3px;
+  transition: background .12s, color .12s, border-color .12s;
+  word-break: break-word;
+  cursor: pointer;
+}}
+.toc-link:hover {{
+  background: var(--accent-light);
+  color: var(--fg);
+  border-bottom-color: transparent;
+}}
+.toc-link.active {{
+  color: var(--accent);
+  border-left-color: var(--accent);
+  background: var(--accent-light);
+  font-weight: 600;
+}}
+.toc-link[data-level="1"] {{ padding-left: 12px; font-weight: 600; }}
+.toc-link[data-level="2"] {{ padding-left: 24px; }}
+.toc-link[data-level="3"] {{ padding-left: 36px; font-size: 12.5px; }}
+
+.toc-resizer {{
+  position: absolute;
+  top: 0;
+  right: -2px;
+  width: 5px;
+  height: 100%;
+  cursor: ew-resize;
+  z-index: 10;
+  background: transparent;
+  transition: background .15s;
+}}
+.toc-resizer:hover,
+.toc-resizer.dragging {{
+  background: var(--accent);
+  opacity: 0.4;
+}}
+
+.main-scroll {{
+  flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  margin: 0 8px 8px 8px;
+  min-width: 0;
+}}
+
+/* Toggle button that hugs the right edge of the sidebar */
+.toc-toggle {{
+  position: absolute;
+  top: 14px;
+  width: 18px;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-left: none;
+  border-radius: 0 6px 6px 0;
+  background: var(--block-bg);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  z-index: 15;
+  transition: background .12s, left .2s ease, transform .2s ease;
+  box-shadow: 1px 1px 3px rgba(0,0,0,.06);
+}}
+.toc-toggle svg {{
+  width: 10px;
+  height: 10px;
+  stroke: var(--fg-secondary);
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform .25s ease;
+}}
+.toc-toggle:hover {{
+  background: var(--accent-light);
+}}
+.toc-toggle:hover svg {{
+  stroke: var(--accent);
+}}
+.toc-toggle.collapsed svg {{
+  transform: rotate(180deg);
 }}
 
 /* ===== Custom Title Bar ===== */
@@ -862,10 +984,14 @@ body {{
 }}
 
 /* ===== Scrollbar ===== */
-.content-area::-webkit-scrollbar {{ width: 8px; }}
-.content-area::-webkit-scrollbar-track {{ background: transparent; }}
-.content-area::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 4px; }}
-.content-area::-webkit-scrollbar-thumb:hover {{ background: var(--fg-secondary); }}
+.main-scroll::-webkit-scrollbar,
+.toc-content::-webkit-scrollbar {{ width: 8px; }}
+.main-scroll::-webkit-scrollbar-track,
+.toc-content::-webkit-scrollbar-track {{ background: transparent; }}
+.main-scroll::-webkit-scrollbar-thumb,
+.toc-content::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 4px; }}
+.main-scroll::-webkit-scrollbar-thumb:hover,
+.toc-content::-webkit-scrollbar-thumb:hover {{ background: var(--fg-secondary); }}
 
 /* ===== Content ===== */
 .container {{
@@ -1208,9 +1334,19 @@ summary {{ cursor: pointer; font-weight: 600; }}
 </div>
 
 <div class="content-area">
+<aside class="toc-sidebar" id="tocSidebar">
+  <div class="toc-header">目录</div>
+  <div class="toc-content"><ul class="toc-list" id="tocList"></ul></div>
+  <div class="toc-resizer" id="tocResizer"></div>
+</aside>
+<button class="toc-toggle" id="tocToggle" title="Toggle outline" type="button">
+  <svg viewBox="0 0 10 10"><polyline points="6.5,2 3.5,5 6.5,8"/></svg>
+</button>
+<main class="main-scroll" id="mainScroll">
 <div class="container">
 {html_body}
 </div>
+</main>
 </div>
 
 <script>
@@ -1339,6 +1475,153 @@ document.querySelectorAll('.syntect-block').forEach(block => {{
     }}, 1500);
   }});
 }});
+
+// ===== TOC (Table of Contents) =====
+(function() {{
+  const container = document.querySelector('.container');
+  const tocList = document.getElementById('tocList');
+  const sidebar = document.getElementById('tocSidebar');
+  const mainScroll = document.getElementById('mainScroll');
+  const toggleBtn = document.getElementById('tocToggle');
+  if (!container || !tocList || !sidebar || !mainScroll || !toggleBtn) return;
+
+  const headings = Array.from(container.querySelectorAll('h1, h2, h3'));
+  if (headings.length === 0) {{
+    sidebar.classList.add('collapsed');
+    toggleBtn.style.display = 'none';
+    return;
+  }}
+
+  function syncToggleBtn() {{
+    const collapsed = sidebar.classList.contains('collapsed');
+    const left = collapsed ? 0 : sidebar.offsetWidth;
+    toggleBtn.style.left = left + 'px';
+    toggleBtn.classList.toggle('collapsed', collapsed);
+  }}
+  toggleBtn.addEventListener('click', () => {{
+    sidebar.classList.toggle('collapsed');
+    syncToggleBtn();
+  }});
+
+  function slugify(text) {{
+    return text.toLowerCase().trim()
+      .replace(/[^\w\u4e00-\u9fa5\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '') || 'h';
+  }}
+
+  const used = new Map();
+  const entries = [];
+  headings.forEach(h => {{
+    let id = h.id;
+    if (!id) {{
+      const base = slugify(h.textContent);
+      const n = used.get(base) || 0;
+      used.set(base, n + 1);
+      id = n === 0 ? base : base + '-' + n;
+      h.id = id;
+    }}
+    entries.push({{ el: h, id: id, text: h.textContent, level: parseInt(h.tagName[1]) }});
+  }});
+
+  const links = new Map();
+  const frag = document.createDocumentFragment();
+  entries.forEach(e => {{
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.className = 'toc-link';
+    a.href = '#' + e.id;
+    a.textContent = e.text;
+    a.setAttribute('data-level', e.level);
+    a.setAttribute('data-id', e.id);
+    a.addEventListener('click', (ev) => {{
+      ev.preventDefault();
+      const top = e.el.offsetTop - 8;
+      mainScroll.scrollTo({{ top: top, behavior: 'smooth' }});
+    }});
+    li.appendChild(a);
+    frag.appendChild(li);
+    links.set(e.id, a);
+  }});
+  tocList.appendChild(frag);
+
+  // Active highlight: pick the last heading whose top is above a threshold
+  let activeId = null;
+  function updateActive() {{
+    const threshold = 80;
+    let candidate = null;
+    for (const e of entries) {{
+      const rect = e.el.getBoundingClientRect();
+      const scrollRect = mainScroll.getBoundingClientRect();
+      const relTop = rect.top - scrollRect.top;
+      if (relTop <= threshold) candidate = e.id;
+      else break;
+    }}
+    if (!candidate && entries.length > 0) candidate = entries[0].id;
+    if (candidate !== activeId) {{
+      if (activeId && links.get(activeId)) links.get(activeId).classList.remove('active');
+      activeId = candidate;
+      if (activeId && links.get(activeId)) {{
+        const link = links.get(activeId);
+        link.classList.add('active');
+        // auto-scroll TOC to keep active visible
+        const lr = link.getBoundingClientRect();
+        const cr = link.closest('.toc-content').getBoundingClientRect();
+        if (lr.top < cr.top || lr.bottom > cr.bottom) {{
+          link.scrollIntoView({{ block: 'nearest' }});
+        }}
+      }}
+    }}
+  }}
+  let rafId = 0;
+  mainScroll.addEventListener('scroll', () => {{
+    if (rafId) return;
+    rafId = requestAnimationFrame(() => {{ rafId = 0; updateActive(); }});
+  }});
+  updateActive();
+
+  // Resizer with min/max + persistence
+  const resizer = document.getElementById('tocResizer');
+  const MIN_W = 180, MAX_W = 480;
+  try {{
+    const saved = parseInt(localStorage.getItem('mdv-toc-width') || '0', 10);
+    if (saved >= MIN_W && saved <= MAX_W) sidebar.style.width = saved + 'px';
+  }} catch(_) {{}}
+
+  let dragging = false, startX = 0, startW = 0;
+  resizer.addEventListener('mousedown', (ev) => {{
+    dragging = true;
+    startX = ev.clientX;
+    startW = sidebar.offsetWidth;
+    resizer.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'ew-resize';
+    toggleBtn.style.transition = 'background .12s';
+    ev.preventDefault();
+    ev.stopPropagation();
+  }});
+  document.addEventListener('mousemove', (ev) => {{
+    if (!dragging) return;
+    let w = startW + (ev.clientX - startX);
+    if (w < MIN_W) w = MIN_W;
+    if (w > MAX_W) w = MAX_W;
+    sidebar.style.width = w + 'px';
+    toggleBtn.style.left = w + 'px';
+  }});
+  document.addEventListener('mouseup', () => {{
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('dragging');
+    document.body.style.userSelect = '';
+    document.body.style.cursor = '';
+    toggleBtn.style.transition = '';
+    try {{ localStorage.setItem('mdv-toc-width', sidebar.offsetWidth); }} catch(_) {{}}
+  }});
+
+  syncToggleBtn();
+  window.addEventListener('resize', syncToggleBtn);
+}})();
 </script>
 </body>
 </html>"#,
