@@ -7,7 +7,6 @@
 **[下载最新版本](https://gitee.com/jimyliu/md-viewer/releases/latest)**
 
 ## 功能特性
-
 - **即时预览** — 双击 `.md` 文件即可查看渲染效果
 - **语法高亮** — 代码块深色主题 + 行号 + 一键复制
 - **图片支持** — 自动内嵌本地图片（markdown 和 HTML `<img>` 两种写法）
