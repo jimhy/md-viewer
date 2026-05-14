@@ -91,6 +91,30 @@ impl AppState {
         }
     }
 
+    fn replace_with_path(&mut self, id: u64, path: &PathBuf) -> bool {
+        let markdown = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Untitled.md".to_string());
+        let base_dir = path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let normalized = canonical_or_keep(path);
+        if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
+            d.path = normalized;
+            d.name = name;
+            d.base_dir = base_dir;
+            d.markdown = markdown;
+            return true;
+        }
+        false
+    }
+
     fn remove(&mut self, id: u64) {
         self.docs.retain(|d| d.id != id);
     }
@@ -544,6 +568,82 @@ fn handle_ipc(
         return;
     }
 
+    if let Some(b64) = body.strip_prefix("open-path-preview:") {
+        let bytes = match base64_decode(b64) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let path_str = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let path = PathBuf::from(path_str);
+        let script = {
+            let mut s = state.borrow_mut();
+            match s.add_from_path(&path) {
+                Some(r) if r.is_new => {
+                    if let Some(doc) = s.find(r.id) {
+                        let html_body = render_markdown_body(&doc.markdown, &doc.base_dir);
+                        Some(format!(
+                            "window.mdv && mdv.addDocPreview({}, '{}', '{}', '{}', '{}');",
+                            r.id,
+                            base64_encode(doc.name.as_bytes()),
+                            base64_encode(doc.base_dir.as_bytes()),
+                            base64_encode(doc.markdown.as_bytes()),
+                            base64_encode(html_body.as_bytes()),
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                Some(r) => Some(format!("window.mdv && mdv.switchTo({});", r.id)),
+                None => None,
+            }
+        };
+        if let Some(script) = script {
+            if let Some(wv) = webview.borrow().as_ref() {
+                let _ = wv.evaluate_script(&script);
+            }
+        }
+        return;
+    }
+
+    if let Some(rest) = body.strip_prefix("replace-doc:") {
+        if let Some((id_str, b64)) = rest.split_once(':') {
+            if let Ok(id) = id_str.parse::<u64>() {
+                if let Ok(bytes) = base64_decode(b64) {
+                    if let Ok(path_str) = String::from_utf8(bytes) {
+                        let path = PathBuf::from(path_str);
+                        let script = {
+                            let mut s = state.borrow_mut();
+                            if s.replace_with_path(id, &path) {
+                                s.find(id).map(|doc| {
+                                    let html_body = render_markdown_body(&doc.markdown, &doc.base_dir);
+                                    format!(
+                                        "window.mdv && mdv.replaceDoc({}, '{}', '{}', '{}', '{}');",
+                                        id,
+                                        base64_encode(doc.name.as_bytes()),
+                                        base64_encode(doc.base_dir.as_bytes()),
+                                        base64_encode(doc.markdown.as_bytes()),
+                                        base64_encode(html_body.as_bytes()),
+                                    )
+                                })
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(script) = script {
+                            if let Some(wv) = webview.borrow().as_ref() {
+                                let _ = wv.evaluate_script(&script);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if let Some(b64) = body.strip_prefix("open-path:") {
         let bytes = match base64_decode(b64) {
             Ok(b) => b,
@@ -612,6 +712,43 @@ fn handle_ipc(
             if let Some(script) = script {
                 if let Some(wv) = webview.borrow().as_ref() {
                     let _ = wv.evaluate_script(&script);
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(rest) = body.strip_prefix("paste-image:") {
+        if let Some((id_str, b64)) = rest.split_once(':') {
+            if let Ok(id) = id_str.parse::<u64>() {
+                if let Ok(data) = base64_decode(b64) {
+                    let ext = detect_image_ext(&data);
+                    let base_dir_opt = {
+                        let s = state.borrow();
+                        s.find(id).map(|d| d.base_dir.clone())
+                    };
+                    if let Some(base_dir) = base_dir_opt {
+                        if !base_dir.is_empty() {
+                            let images_dir = PathBuf::from(&base_dir).join("images");
+                            let _ = fs::create_dir_all(&images_dir);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis();
+                            let filename = format!("paste-{}.{}", now, ext);
+                            let full = images_dir.join(&filename);
+                            if fs::write(&full, &data).is_ok() {
+                                let rel_path = format!("images/{}", filename);
+                                let script = format!(
+                                    "window.mdv && mdv.pasteImageInserted('{}');",
+                                    base64_encode(rel_path.as_bytes())
+                                );
+                                if let Some(wv) = webview.borrow().as_ref() {
+                                    let _ = wv.evaluate_script(&script);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -937,6 +1074,22 @@ fn show_open_dialog(owner_hwnd: isize) -> Vec<PathBuf> {
     }
     let dir = PathBuf::from(&segments[0]);
     segments[1..].iter().map(|n| dir.join(n)).collect()
+}
+
+fn detect_image_ext(data: &[u8]) -> &'static str {
+    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        "png"
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if data.starts_with(b"GIF8") {
+        "gif"
+    } else if data.starts_with(b"RIFF") && data.len() > 11 && &data[8..12] == b"WEBP" {
+        "webp"
+    } else if data.starts_with(b"BM") {
+        "bmp"
+    } else {
+        "png"
+    }
 }
 
 fn scan_md_files(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>, depth: u32) {
@@ -1295,47 +1448,126 @@ fn replace_img_src(tag: &str, base_dir: &str) -> Option<String> {
     Some(new_tag)
 }
 
+fn is_block_start_tag(tag: &Tag) -> bool {
+    matches!(
+        tag,
+        Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(..)
+            | Tag::CodeBlock(_)
+            | Tag::List(_)
+            | Tag::FootnoteDefinition(_)
+            | Tag::Table(_)
+            | Tag::HtmlBlock
+            | Tag::MetadataBlock(_)
+    )
+}
+
+fn is_block_end_tag(tag: &TagEnd) -> bool {
+    matches!(
+        tag,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(..)
+            | TagEnd::CodeBlock
+            | TagEnd::List(_)
+            | TagEnd::FootnoteDefinition
+            | TagEnd::Table
+            | TagEnd::HtmlBlock
+            | TagEnd::MetadataBlock(_)
+    )
+}
+
 fn render_markdown_body(markdown: &str, base_dir: &str) -> String {
     let mut options = Options::all();
     options.remove(Options::ENABLE_SMART_PUNCTUATION);
+
+    // Byte-offset -> line index, for tagging each top-level block with its source line.
+    let line_starts: Vec<usize> = {
+        let mut v = vec![0usize];
+        for (i, b) in markdown.bytes().enumerate() {
+            if b == b'\n' {
+                v.push(i + 1);
+            }
+        }
+        v
+    };
+    let byte_to_line = |offset: usize| -> usize {
+        match line_starts.binary_search(&offset) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+    };
 
     let ss = SyntaxSet::load_defaults_newlines();
     let ts = ThemeSet::load_defaults();
     let theme = &ts.themes["base16-ocean.dark"];
 
-    let parser = Parser::new_ext(markdown, options);
+    let parser = Parser::new_ext(markdown, options).into_offset_iter();
     let mut html_body = String::new();
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let mut code_text = String::new();
     let mut in_image = false;
+    let mut block_depth: u32 = 0;
 
-    for event in parser {
+    for (event, range) in parser {
+        // Wrap top-level block starts with <div class="md-block" data-md-line="N">
+        if let MdEvent::Start(ref tag) = event {
+            if is_block_start_tag(tag) {
+                if block_depth == 0 {
+                    let line = byte_to_line(range.start);
+                    html_body.push_str(&format!(
+                        "<div class=\"md-block\" data-md-line=\"{}\">",
+                        line
+                    ));
+                }
+                block_depth += 1;
+                if let Tag::CodeBlock(kind) = tag {
+                    in_code_block = true;
+                    code_text.clear();
+                    code_lang = match kind {
+                        CodeBlockKind::Fenced(lang) => lang.to_string(),
+                        _ => String::new(),
+                    };
+                    continue;
+                }
+                pulldown_cmark::html::push_html(&mut html_body, std::iter::once(event));
+                continue;
+            }
+        }
+
+        // Close <div> after top-level block end.
+        if let MdEvent::End(ref tag_end) = event {
+            if is_block_end_tag(tag_end) {
+                if matches!(tag_end, TagEnd::CodeBlock) {
+                    in_code_block = false;
+                    let lang_token = if code_lang.is_empty() { "txt" } else { &code_lang };
+                    let syntax = ss
+                        .find_syntax_by_token(lang_token)
+                        .unwrap_or_else(|| ss.find_syntax_plain_text());
+                    let highlighted = highlighted_html_for_string(&code_text, &ss, syntax, theme)
+                        .unwrap_or_else(|_| {
+                            format!("<pre><code>{}</code></pre>", html_escape(&code_text))
+                        });
+                    html_body.push_str(&format!(
+                        "<div class=\"syntect-block\" data-lang=\"{lang}\">{highlighted}</div>",
+                        lang = html_escape(&code_lang),
+                        highlighted = highlighted
+                    ));
+                } else {
+                    pulldown_cmark::html::push_html(&mut html_body, std::iter::once(event));
+                }
+                block_depth = block_depth.saturating_sub(1);
+                if block_depth == 0 {
+                    html_body.push_str("</div>");
+                }
+                continue;
+            }
+        }
+
+        // Inline / other events
         match event {
-            MdEvent::Start(Tag::CodeBlock(kind)) => {
-                in_code_block = true;
-                code_text.clear();
-                code_lang = match kind {
-                    CodeBlockKind::Fenced(lang) => lang.to_string(),
-                    _ => String::new(),
-                };
-            }
-            MdEvent::End(TagEnd::CodeBlock) => {
-                in_code_block = false;
-                let lang_token = if code_lang.is_empty() { "txt" } else { &code_lang };
-                let syntax = ss
-                    .find_syntax_by_token(lang_token)
-                    .unwrap_or_else(|| ss.find_syntax_plain_text());
-                let highlighted = highlighted_html_for_string(&code_text, &ss, syntax, theme)
-                    .unwrap_or_else(|_| {
-                        format!("<pre><code>{}</code></pre>", html_escape(&code_text))
-                    });
-                html_body.push_str(&format!(
-                    "<div class=\"syntect-block\" data-lang=\"{lang}\">{highlighted}</div>",
-                    lang = html_escape(&code_lang),
-                    highlighted = highlighted
-                ));
-            }
             MdEvent::Text(text) if in_code_block => {
                 code_text.push_str(&text);
             }
@@ -1357,6 +1589,13 @@ fn render_markdown_body(markdown: &str, base_dir: &str) -> String {
             MdEvent::End(TagEnd::Image) => {
                 html_body.push_str("\" />");
                 in_image = false;
+            }
+            MdEvent::Rule => {
+                let line = byte_to_line(range.start);
+                html_body.push_str(&format!(
+                    "<hr class=\"md-block\" data-md-line=\"{}\" />",
+                    line
+                ));
             }
             other => {
                 pulldown_cmark::html::push_html(&mut html_body, std::iter::once(other));
@@ -1498,12 +1737,14 @@ body {{
 }}
 .titlebar-ver {{ font-size: 10px; opacity: 0.5; font-weight: 400; }}
 
-/* ===== Tab bar ===== */
+/* ===== Tab bar (own row below titlebar) ===== */
 .tab-bar {{
-  flex: 1;
-  min-width: 0;
+  flex-shrink: 0;
+  height: 34px;
   display: flex;
   align-items: stretch;
+  background: var(--titlebar-bg);
+  border-bottom: 1px solid var(--titlebar-border);
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
@@ -1513,13 +1754,13 @@ body {{
 .tab-bar.empty {{ display: none; }}
 .tab {{
   flex-shrink: 0;
-  min-width: 80px;
-  max-width: 200px;
+  min-width: 100px;
+  max-width: 240px;
   height: 100%;
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 0 8px 0 12px;
+  padding: 0 8px 0 14px;
   background: var(--tab-bg);
   border-right: 1px solid var(--titlebar-border);
   cursor: pointer;
@@ -1529,13 +1770,13 @@ body {{
 }}
 .tab:hover {{ background: var(--tab-hover); color: var(--fg); }}
 .tab.active {{
-  background: var(--tab-active-bg);
+  background: var(--bg);
   color: var(--fg);
 }}
 .tab.active::after {{
   content: '';
   position: absolute;
-  left: 0; right: 0; bottom: 0;
+  left: 0; right: 0; bottom: -1px;
   height: 2px;
   background: var(--tab-active-border);
 }}
@@ -1932,6 +2173,47 @@ body {{
   margin: 0 4px;
   flex-shrink: 0;
 }}
+
+/* Slash command popup */
+.slash-popup {{
+  position: fixed;
+  z-index: 9999;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  padding: 4px;
+  min-width: 220px;
+  max-width: 320px;
+  max-height: 280px;
+  overflow-y: auto;
+  font-size: 13px;
+}}
+.slash-popup[hidden] {{ display: none; }}
+.slash-item {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  color: var(--fg);
+  user-select: none;
+}}
+.slash-item .slash-key {{
+  font-size: 11px;
+  color: var(--fg-secondary);
+  font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+  margin-left: auto;
+}}
+.slash-item:hover {{ background: var(--btn-hover); }}
+.slash-item.selected {{
+  background: var(--accent-light);
+  color: var(--accent);
+}}
+.slash-item.selected .slash-key {{ color: var(--accent); }}
+.slash-popup::-webkit-scrollbar {{ width: 6px; }}
+.slash-popup::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}
 .editor-textarea {{
   flex: 1;
   width: 100%;
@@ -2070,6 +2352,21 @@ body {{
   min-width: 0;
   margin: 0 auto;
   padding: 32px 40px 80px;
+}}
+
+/* Block wrappers used for cursor-line highlight in split mode */
+.md-block {{
+  border-left: 3px solid transparent;
+  padding-left: 10px;
+  margin-left: -13px;
+  transition: border-color .15s ease;
+}}
+.md-block.cursor-line {{
+  border-left-color: var(--accent);
+}}
+hr.md-block {{
+  margin-left: -13px;
+  padding-left: 10px;
 }}
 
 h1, h2, h3, h4, h5, h6 {{
@@ -2293,7 +2590,6 @@ summary {{ cursor: pointer; font-weight: 600; }}
     <svg class='titlebar-img' viewBox='0 0 20 20' xmlns='http://www.w3.org/2000/svg'><rect width='20' height='20' rx='4' fill='rgb(58,124,140)'/><path d='M4 14V6l2.5 4L9 6v8' stroke='white' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/><path d='M12 10v4m0 0l-1.5-2m1.5 2l1.5-2' stroke='white' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/><rect x='11' y='6' width='5' height='3' rx='0.8' fill='none' stroke='white' stroke-width='1' opacity='0.5'/></svg>
     <span class="titlebar-brand">MD Viewer <span class="titlebar-ver">v{ver}</span></span>
   </div>
-  <div class="tab-bar empty" id="tabBar"></div>
   <div class="titlebar-controls">
     <button class="titlebar-btn" id="btnMin" title="Minimize">
       <svg viewBox="0 0 10 10"><line x1="1" y1="5" x2="9" y2="5"/></svg>
@@ -2306,6 +2602,10 @@ summary {{ cursor: pointer; font-weight: 600; }}
     </button>
   </div>
 </div>
+
+<div class="tab-bar empty" id="tabBar"></div>
+
+<div class="slash-popup" id="slashPopup" hidden></div>
 
 <div class="content-area no-doc" id="contentArea">
   <aside class="toc-sidebar" id="tocSidebar">
@@ -2425,6 +2725,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
   const docs = new Map();
   const docOrder = [];
   let activeId = null;
+  let previewId = null;
   let mode = 'view';
   let renderTimer = null;
 
@@ -2486,6 +2787,10 @@ summary {{ cursor: pointer; font-weight: 600; }}
       label.className = 'tab-label';
       label.textContent = (doc.dirty ? '* ' : '') + doc.name;
       if (doc.dirty) t.classList.add('dirty');
+      if (doc.isPreview) {{
+        t.classList.add('preview');
+        label.style.fontStyle = 'italic';
+      }}
       const close = document.createElement('button');
       close.className = 'tab-close';
       close.title = '关闭';
@@ -2494,6 +2799,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
       t.appendChild(label);
       t.appendChild(close);
       t.addEventListener('click', () => switchTo(id));
+      t.addEventListener('dblclick', () => promoteToPermanent(id));
       t.addEventListener('mousedown', (e) => {{
         if (e.button === 1) {{ e.preventDefault(); closeDoc(id); }}
       }});
@@ -2517,6 +2823,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     enhanceCodeBlocks(previewContainer);
     if (mode === 'view') buildTOC();
     if (preserveScroll) mainScroll.scrollTop = prev;
+    if (mode === 'split') highlightCursorBlock();
   }}
 
   function showEmptyState() {{
@@ -2543,7 +2850,10 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (editorTA.value !== doc.markdown) editorTA.value = doc.markdown;
     setPreviewHtml(doc.htmlBody, false);
     if (mode === 'edit') editorTA.focus();
-    if (sidebarPane === 'files') requestFileTree();
+    // Preview tabs intentionally do NOT refresh the file tree — the tree
+    // stays anchored to the last permanent doc so users keep their navigation
+    // context while quickly previewing files.
+    if (sidebarPane === 'files' && !doc.isPreview) requestFileTree();
   }}
 
   function closeDoc(id) {{
@@ -2562,6 +2872,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     const wasActive = (activeId === id);
     if (!docs.has(id)) return;
     docs.delete(id);
+    if (previewId === id) previewId = null;
     const idx = docOrder.indexOf(id);
     if (idx >= 0) docOrder.splice(idx, 1);
     try {{ window.ipc.postMessage('close-tab:' + id); }} catch(_) {{}}
@@ -2600,12 +2911,63 @@ summary {{ cursor: pointer; font-weight: 600; }}
       const d = docs.get(id);
       d.name = name; d.baseDir = baseDir; d.markdown = markdown; d.htmlBody = htmlBody;
       d.dirty = false;
+      d.isPreview = false;
     }} else {{
-      docs.set(id, {{id, name, baseDir, markdown, htmlBody, dirty: false}});
+      docs.set(id, {{id, name, baseDir, markdown, htmlBody, dirty: false, isPreview: false}});
       docOrder.push(id);
     }}
     if (makeActive) switchTo(id);
     else renderTabBar();
+  }}
+
+  function addDocPreview(id, nameB64, baseB64, mdB64, htmlB64) {{
+    const name = decB64(nameB64);
+    const baseDir = decB64(baseB64);
+    const markdown = decB64(mdB64);
+    const htmlBody = decB64(htmlB64);
+    // If a preview tab exists, drop it first to keep only one preview.
+    if (previewId !== null && previewId !== id && docs.has(previewId)) {{
+      const old = previewId;
+      docs.delete(old);
+      const idx = docOrder.indexOf(old);
+      if (idx >= 0) docOrder.splice(idx, 1);
+      try {{ window.ipc.postMessage('close-tab:' + old); }} catch(_) {{}}
+    }}
+    docs.set(id, {{id, name, baseDir, markdown, htmlBody, dirty: false, isPreview: true}});
+    if (!docOrder.includes(id)) docOrder.push(id);
+    previewId = id;
+    switchTo(id);
+  }}
+
+  function replaceDoc(id, nameB64, baseB64, mdB64, htmlB64) {{
+    const doc = docs.get(id);
+    if (!doc) return;
+    doc.name = decB64(nameB64);
+    doc.baseDir = decB64(baseB64);
+    doc.markdown = decB64(mdB64);
+    doc.htmlBody = decB64(htmlB64);
+    doc.dirty = false;
+    // Replacement keeps preview-ness; it's still a preview tab unless promoted.
+    setBaseHref(doc.baseDir);
+    updateWindowTitle(doc.name);
+    renderTabBar();
+    if (activeId !== id) {{
+      switchTo(id);
+    }} else {{
+      if (editorTA.value !== doc.markdown) editorTA.value = doc.markdown;
+      setPreviewHtml(doc.htmlBody, false);
+    }}
+    // Preview replacements never disturb the file tree.
+    if (sidebarPane === 'files' && !doc.isPreview) requestFileTree();
+  }}
+
+  function promoteToPermanent(id) {{
+    const doc = docs.get(id);
+    if (!doc || !doc.isPreview) return;
+    doc.isPreview = false;
+    if (previewId === id) previewId = null;
+    renderTabBar();
+    if (sidebarPane === 'files') renderFileTree();
   }}
 
   function markSaved(id) {{
@@ -2645,6 +3007,11 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }});
     if (m === 'view' && activeId !== null) buildTOC();
     if (m === 'edit') {{ setTimeout(() => editorTA.focus(), 0); }}
+    if (m === 'split') highlightCursorBlock();
+    else if (m !== 'split') {{
+      const prev = previewContainer.querySelector('.md-block.cursor-line');
+      if (prev) prev.classList.remove('cursor-line');
+    }}
   }}
 
   // ===== Code block enhancement =====
@@ -2736,9 +3103,10 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (!previewContainer || !tocList) return;
     const headings = Array.from(previewContainer.querySelectorAll('h1, h2, h3'));
     tocList.innerHTML = '';
+    // Keep the sidebar visible even when the doc has no headings — the Files
+    // pane lives in the same sidebar and must stay reachable. Just leave the
+    // TOC list empty.
     if (headings.length === 0) {{
-      tocSidebar.classList.add('collapsed');
-      tocToggle.style.display = 'none';
       return;
     }}
     tocSidebar.classList.remove('collapsed');
@@ -2876,7 +3244,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (activeId === null) return '';
     const doc = docs.get(activeId);
     if (!doc) return '';
-    // Path is "<baseDir>/<name>"
+    // Preview tabs should not "navigate" the tree highlight — only permanent
+    // tabs mark the corresponding file as active in the tree.
+    if (doc.isPreview) return '';
     if (doc.baseDir === currentTreeBase) return doc.name;
     return '';
   }}
@@ -2969,7 +3339,21 @@ summary {{ cursor: pointer; font-weight: 600; }}
           '<span class="tree-name"></span>';
         item.querySelector('.tree-name').textContent = child.name;
         item.title = child.fullPath;
-        item.addEventListener('click', () => openFromTree(child.fullPath));
+        let treeClickTimer = null;
+        item.addEventListener('click', () => {{
+          if (treeClickTimer) return; // ignore second click within window — handled by dblclick
+          treeClickTimer = setTimeout(() => {{
+            treeClickTimer = null;
+            openFromTree(child.fullPath, false);
+          }}, 220);
+        }});
+        item.addEventListener('dblclick', () => {{
+          if (treeClickTimer) {{
+            clearTimeout(treeClickTimer);
+            treeClickTimer = null;
+          }}
+          openFromTree(child.fullPath, true);
+        }});
         el.appendChild(item);
       }} else {{
         el.className = 'tree-folder';
@@ -2998,11 +3382,35 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }}
   }}
 
-  function openFromTree(relPath) {{
+  function openFromTree(relPath, permanent) {{
     if (!currentTreeBase) return;
     const sep = currentTreeBase.endsWith('/') || currentTreeBase.endsWith('\\') ? '' : '/';
     const abs = currentTreeBase + sep + relPath;
-    try {{ window.ipc.postMessage('open-path:' + encB64(abs)); }} catch(_) {{}}
+    // If file already open, just switch + optionally promote.
+    const existing = findDocByAbsPath(abs);
+    if (existing !== null) {{
+      if (permanent) promoteToPermanent(existing);
+      switchTo(existing);
+      return;
+    }}
+    if (permanent) {{
+      try {{ window.ipc.postMessage('open-path:' + encB64(abs)); }} catch(_) {{}}
+    }} else if (previewId !== null && docs.has(previewId)) {{
+      try {{ window.ipc.postMessage('replace-doc:' + previewId + ':' + encB64(abs)); }} catch(_) {{}}
+    }} else {{
+      try {{ window.ipc.postMessage('open-path-preview:' + encB64(abs)); }} catch(_) {{}}
+    }}
+  }}
+
+  function findDocByAbsPath(abs) {{
+    const target = abs.replace(/\\/g, '/').toLowerCase().replace(/\/+/g, '/');
+    for (const id of docOrder) {{
+      const d = docs.get(id);
+      if (!d) continue;
+      const full = (d.baseDir + '/' + d.name).replace(/\\/g, '/').toLowerCase().replace(/\/+/g, '/');
+      if (full === target) return id;
+    }}
+    return null;
   }}
 
   if (filesSearch) {{
@@ -3103,12 +3511,23 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (!doc) return;
     if (doc.markdown !== editorTA.value) {{
       doc.markdown = editorTA.value;
+      let needTabRefresh = false;
       if (!doc.dirty) {{
         doc.dirty = true;
-        renderTabBar();
+        needTabRefresh = true;
       }}
+      let promoted = false;
+      if (doc.isPreview) {{
+        doc.isPreview = false;
+        if (previewId === activeId) previewId = null;
+        needTabRefresh = true;
+        promoted = true;
+      }}
+      if (needTabRefresh) renderTabBar();
+      if (promoted && sidebarPane === 'files') renderFileTree();
     }}
     if (mode === 'split') {{
+      highlightCursorBlock();
       if (renderTimer) clearTimeout(renderTimer);
       renderTimer = setTimeout(() => {{
         try {{ window.ipc.postMessage('render:' + activeId + ':' + encB64(doc.markdown)); }} catch(_) {{}}
@@ -3123,6 +3542,257 @@ summary {{ cursor: pointer; font-weight: 600; }}
       document.execCommand('insertText', false, '  ');
       return;
     }}
+  }});
+
+  // ===== Paste image (Ctrl+V on an image in clipboard) =====
+  const pendingPastes = [];
+  editorTA.addEventListener('paste', (e) => {{
+    if (!e.clipboardData) return;
+    const items = e.clipboardData.items || [];
+    for (let i = 0; i < items.length; i++) {{
+      const it = items[i];
+      if (it.type && it.type.indexOf('image/') === 0) {{
+        const file = it.getAsFile();
+        if (!file) continue;
+        e.preventDefault();
+        if (activeId === null) return;
+        const tag = 'paste-' + Date.now() + '-' + Math.floor(Math.random() * 100000);
+        const placeholder = '![上传中...](' + tag + ')';
+        pendingPastes.push(tag);
+        editorTA.focus();
+        document.execCommand('insertText', false, placeholder);
+        const reader = new FileReader();
+        reader.onload = () => {{
+          const dataUrl = String(reader.result || '');
+          const idx = dataUrl.indexOf(',');
+          if (idx < 0) return;
+          const b64 = dataUrl.slice(idx + 1);
+          try {{ window.ipc.postMessage('paste-image:' + activeId + ':' + b64); }} catch(_) {{}}
+        }};
+        reader.readAsDataURL(file);
+        return;
+      }}
+    }}
+  }});
+
+  function pasteImageInserted(relPathB64) {{
+    const relPath = decB64(relPathB64);
+    const tag = pendingPastes.shift();
+    if (!tag) return;
+    const placeholder = '![上传中...](' + tag + ')';
+    const replacement = '![](' + relPath + ')';
+    const v = editorTA.value;
+    const idx = v.indexOf(placeholder);
+    if (idx < 0) return;
+    editorTA.focus();
+    editorTA.selectionStart = idx;
+    editorTA.selectionEnd = idx + placeholder.length;
+    document.execCommand('insertText', false, replacement);
+    const newPos = idx + replacement.length;
+    editorTA.selectionStart = editorTA.selectionEnd = newPos;
+  }}
+
+  // ===== Slash command popup =====
+  const slashPopup = document.getElementById('slashPopup');
+  const SLASH_ITEMS = [
+    {{ label: 'H1 一级标题',  keys: 'h1 标题 heading',           hint: 'Ctrl+1', action: 'h1' }},
+    {{ label: 'H2 二级标题',  keys: 'h2 标题 heading',           hint: 'Ctrl+2', action: 'h2' }},
+    {{ label: 'H3 三级标题',  keys: 'h3 标题 heading',           hint: 'Ctrl+3', action: 'h3' }},
+    {{ label: '加粗',         keys: 'b bold 加粗',               hint: 'Ctrl+B', action: 'bold' }},
+    {{ label: '斜体',         keys: 'i italic 斜体',             hint: 'Ctrl+I', action: 'italic' }},
+    {{ label: '删除线',       keys: 'strike 删除 删除线',        hint: 'Ctrl+Shift+X', action: 'strike' }},
+    {{ label: '行内代码',     keys: 'code 代码 inline',          hint: 'Ctrl+E', action: 'code' }},
+    {{ label: '代码块',       keys: 'codeblock 代码块 fence',    hint: 'Ctrl+Shift+E', action: 'codeblock' }},
+    {{ label: '引用',         keys: 'quote 引用',                hint: 'Ctrl+Q', action: 'quote' }},
+    {{ label: '无序列表',     keys: 'ul list 列表 无序',         hint: 'Ctrl+L', action: 'ul' }},
+    {{ label: '有序列表',     keys: 'ol list 列表 有序',         hint: 'Ctrl+Shift+L', action: 'ol' }},
+    {{ label: '任务列表',     keys: 'task todo 任务 列表 复选',  hint: 'Ctrl+T', action: 'task' }},
+    {{ label: '链接',         keys: 'link 链接',                 hint: 'Ctrl+K', action: 'link' }},
+    {{ label: '图片',         keys: 'image img 图片',            hint: 'Ctrl+Shift+I', action: 'image' }},
+    {{ label: '表格',         keys: 'table 表格 grid',           hint: 'Ctrl+Shift+M', action: 'table' }},
+    {{ label: '分隔线',       keys: 'hr rule 分隔 分割 横线',    hint: 'Ctrl+Shift+H', action: 'hr' }},
+  ];
+  let slashActive = false;
+  let slashStart = -1;
+  let slashQuery = '';
+  let slashSelected = 0;
+  let slashFiltered = SLASH_ITEMS;
+
+  function getCaretCoords(ta, pos) {{
+    const mirror = document.createElement('div');
+    const cs = window.getComputedStyle(ta);
+    const props = [
+      'boxSizing', 'width', 'height', 'overflowX', 'overflowY',
+      'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+      'borderStyle',
+      'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+      'fontStyle', 'fontVariant', 'fontWeight', 'fontStretch', 'fontSize',
+      'fontSizeAdjust', 'lineHeight', 'fontFamily',
+      'textAlign', 'textTransform', 'textIndent', 'textDecoration',
+      'letterSpacing', 'wordSpacing', 'tabSize', 'whiteSpace'
+    ];
+    for (const p of props) {{ mirror.style[p] = cs[p]; }}
+    mirror.style.position = 'absolute';
+    mirror.style.visibility = 'hidden';
+    mirror.style.whiteSpace = 'pre-wrap';
+    mirror.style.wordWrap = 'break-word';
+    mirror.style.top = '0';
+    mirror.style.left = '-9999px';
+    document.body.appendChild(mirror);
+    mirror.textContent = ta.value.slice(0, pos);
+    const span = document.createElement('span');
+    span.textContent = ta.value.slice(pos) || '.';
+    mirror.appendChild(span);
+    const taRect = ta.getBoundingClientRect();
+    const spanRect = span.getBoundingClientRect();
+    const mirrorRect = mirror.getBoundingClientRect();
+    const x = taRect.left + (spanRect.left - mirrorRect.left) - ta.scrollLeft;
+    const y = taRect.top + (spanRect.top - mirrorRect.top) - ta.scrollTop;
+    document.body.removeChild(mirror);
+    const lineHeight = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.2);
+    return {{ x, y, lineHeight }};
+  }}
+
+  function slashHide() {{
+    slashActive = false;
+    slashStart = -1;
+    slashQuery = '';
+    slashSelected = 0;
+    slashPopup.hidden = true;
+  }}
+
+  function slashRender() {{
+    slashPopup.innerHTML = '';
+    if (slashFiltered.length === 0) {{
+      slashHide();
+      return;
+    }}
+    if (slashSelected >= slashFiltered.length) slashSelected = 0;
+    let selectedEl = null;
+    slashFiltered.forEach((item, i) => {{
+      const row = document.createElement('div');
+      row.className = 'slash-item' + (i === slashSelected ? ' selected' : '');
+      const label = document.createElement('span');
+      label.textContent = item.label;
+      row.appendChild(label);
+      const key = document.createElement('span');
+      key.className = 'slash-key';
+      key.textContent = item.hint;
+      row.appendChild(key);
+      row.addEventListener('mousedown', (e) => {{
+        e.preventDefault();
+        slashSelected = i;
+        slashCommit();
+      }});
+      slashPopup.appendChild(row);
+      if (i === slashSelected) selectedEl = row;
+    }});
+    if (selectedEl) {{
+      selectedEl.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
+    }}
+  }}
+
+  function slashPosition() {{
+    if (slashStart < 0) return;
+    const c = getCaretCoords(editorTA, slashStart);
+    slashPopup.style.left = Math.max(8, c.x) + 'px';
+    slashPopup.style.top = (c.y + c.lineHeight + 4) + 'px';
+  }}
+
+  function slashOpen(pos) {{
+    slashActive = true;
+    slashStart = pos;
+    slashQuery = '';
+    slashSelected = 0;
+    slashFiltered = SLASH_ITEMS.slice();
+    slashPopup.hidden = false;
+    slashRender();
+    slashPosition();
+  }}
+
+  function slashUpdateFilter() {{
+    const q = slashQuery.toLowerCase().trim();
+    if (!q) slashFiltered = SLASH_ITEMS.slice();
+    else slashFiltered = SLASH_ITEMS.filter(it =>
+      it.label.toLowerCase().includes(q) || it.keys.toLowerCase().includes(q)
+    );
+    slashSelected = 0;
+    slashRender();
+  }}
+
+  function slashCommit() {{
+    if (!slashActive) return;
+    const item = slashFiltered[slashSelected];
+    if (!item) {{ slashHide(); return; }}
+    // Remove the "/<query>" from editor
+    const v = editorTA.value;
+    const endPos = editorTA.selectionStart;
+    if (slashStart >= 0 && slashStart < endPos) {{
+      editorTA.focus();
+      editorTA.selectionStart = slashStart;
+      editorTA.selectionEnd = endPos;
+      document.execCommand('insertText', false, '');
+    }}
+    slashHide();
+    runMdAction(item.action);
+  }}
+
+  function isSlashTrigger(text, pos) {{
+    // "/" at the very start, or after whitespace/newline
+    if (pos <= 0) return true;
+    const prev = text.charAt(pos - 1);
+    return prev === '\n' || prev === ' ' || prev === '\t';
+  }}
+
+  editorTA.addEventListener('input', () => {{
+    const v = editorTA.value;
+    const pos = editorTA.selectionStart;
+    if (!slashActive) {{
+      // detect newly typed "/"
+      if (pos > 0 && v.charAt(pos - 1) === '/' && isSlashTrigger(v, pos - 1)) {{
+        slashOpen(pos - 1);
+      }}
+      return;
+    }}
+    // Already active: update query / cancel
+    if (pos < slashStart || pos > slashStart + 80) {{
+      slashHide();
+      return;
+    }}
+    if (v.charAt(slashStart) !== '/') {{
+      slashHide();
+      return;
+    }}
+    slashQuery = v.slice(slashStart + 1, pos);
+    if (/\s/.test(slashQuery)) {{
+      slashHide();
+      return;
+    }}
+    slashUpdateFilter();
+  }});
+
+  editorTA.addEventListener('keydown', (e) => {{
+    if (!slashActive) return;
+    if (e.key === 'ArrowDown') {{
+      e.preventDefault();
+      slashSelected = (slashSelected + 1) % slashFiltered.length;
+      slashRender();
+    }} else if (e.key === 'ArrowUp') {{
+      e.preventDefault();
+      slashSelected = (slashSelected - 1 + slashFiltered.length) % slashFiltered.length;
+      slashRender();
+    }} else if (e.key === 'Enter' || e.key === 'Tab') {{
+      e.preventDefault();
+      slashCommit();
+    }} else if (e.key === 'Escape') {{
+      e.preventDefault();
+      slashHide();
+    }}
+  }}, true);
+
+  editorTA.addEventListener('blur', () => {{
+    // Hide popup when editor loses focus, but with delay to allow click on popup item.
+    setTimeout(() => {{ if (slashActive) slashHide(); }}, 150);
   }});
 
   // ===== Markdown toolbar actions =====
@@ -3304,9 +3974,97 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }}, true);
   }})();
 
-  // Scroll listener for TOC
+  // Scroll listener for TOC + split-mode scroll sync
   let rafId = 0;
+  let scrollLock = false;
+  function syncScrollFromEditor() {{
+    if (mode !== 'split' || scrollLock) return;
+    const eMax = (editorTA.scrollHeight - editorTA.clientHeight);
+    if (eMax <= 0) return;
+    scrollLock = true;
+    const ratio = editorTA.scrollTop / eMax;
+    const pMax = (mainScroll.scrollHeight - mainScroll.clientHeight);
+    if (pMax > 0) mainScroll.scrollTop = ratio * pMax;
+    requestAnimationFrame(() => {{ scrollLock = false; }});
+  }}
+  function syncScrollFromPreview() {{
+    if (mode !== 'split' || scrollLock) return;
+    const pMax = (mainScroll.scrollHeight - mainScroll.clientHeight);
+    if (pMax <= 0) return;
+    scrollLock = true;
+    const ratio = mainScroll.scrollTop / pMax;
+    const eMax = (editorTA.scrollHeight - editorTA.clientHeight);
+    if (eMax > 0) editorTA.scrollTop = ratio * eMax;
+    requestAnimationFrame(() => {{ scrollLock = false; }});
+  }}
+  function computeCursorLine() {{
+    if (activeId === null) return -1;
+    const v = editorTA.value;
+    const pos = editorTA.selectionStart;
+    return (v.slice(0, pos).match(/\n/g) || []).length;
+  }}
+  function highlightCursorBlock() {{
+    const prev = previewContainer.querySelector('.md-block.cursor-line');
+    if (prev) prev.classList.remove('cursor-line');
+    if (mode !== 'split') return;
+    const cursorLine = computeCursorLine();
+    if (cursorLine < 0) return;
+    const blocks = previewContainer.querySelectorAll('[data-md-line]');
+    let target = null;
+    for (let i = 0; i < blocks.length; i++) {{
+      const line = parseInt(blocks[i].getAttribute('data-md-line'), 10);
+      if (Number.isFinite(line) && line <= cursorLine) target = blocks[i];
+      else break;
+    }}
+    if (target && target.classList.contains('md-block')) {{
+      target.classList.add('cursor-line');
+    }}
+  }}
+
+  function syncPreviewFromCursor() {{
+    if (mode !== 'split') return;
+    highlightCursorBlock();
+    const v = editorTA.value;
+    if (!v) return;
+    const pos = editorTA.selectionStart;
+    const before = v.slice(0, pos);
+    const cursorLine = (before.match(/\n/g) || []).length;
+    // Prefer anchor-based scroll: align the highlighted block to top of preview.
+    const target = previewContainer.querySelector('.md-block.cursor-line');
+    if (target) {{
+      const pMax = (mainScroll.scrollHeight - mainScroll.clientHeight);
+      if (pMax > 0) {{
+        scrollLock = true;
+        const containerRect = previewContainer.getBoundingClientRect();
+        const targetRect = target.getBoundingClientRect();
+        const offset = (targetRect.top - containerRect.top) + previewContainer.offsetTop;
+        const desired = Math.max(0, Math.min(pMax, offset - mainScroll.clientHeight * 0.15));
+        mainScroll.scrollTop = desired;
+        requestAnimationFrame(() => {{ scrollLock = false; }});
+        return;
+      }}
+    }}
+    // Fallback: line ratio
+    const totalLines = (v.match(/\n/g) || []).length;
+    const ratio = totalLines > 0 ? cursorLine / totalLines : 0;
+    const pMax = (mainScroll.scrollHeight - mainScroll.clientHeight);
+    if (pMax > 0) {{
+      scrollLock = true;
+      const t = ratio * pMax - mainScroll.clientHeight * 0.25;
+      mainScroll.scrollTop = Math.max(0, Math.min(pMax, t));
+      requestAnimationFrame(() => {{ scrollLock = false; }});
+    }}
+  }}
+  editorTA.addEventListener('click', syncPreviewFromCursor);
+  editorTA.addEventListener('keyup', (e) => {{
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight'
+        || e.key === 'Home' || e.key === 'End' || e.key === 'PageUp' || e.key === 'PageDown') {{
+      syncPreviewFromCursor();
+    }}
+  }});
+  editorTA.addEventListener('scroll', syncScrollFromEditor);
   mainScroll.addEventListener('scroll', () => {{
+    syncScrollFromPreview();
     if (rafId) return;
     rafId = requestAnimationFrame(() => {{ rafId = 0; updateActive(); }});
   }});
@@ -3328,8 +4086,11 @@ summary {{ cursor: pointer; font-weight: 600; }}
   // Expose API to Rust
   window.mdv = {{
     addDoc: addDocFromB64,
+    addDocPreview: addDocPreview,
+    replaceDoc: replaceDoc,
     applyRender: applyRender,
     applyFileTree: applyFileTree,
+    pasteImageInserted: pasteImageInserted,
     markSaved: markSaved,
     saveFailed: saveFailed,
     switchTo: switchTo,
@@ -3345,35 +4106,49 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (e.key === 'F5') {{ e.preventDefault(); e.stopPropagation(); return; }}
     if (!(e.ctrlKey || e.metaKey)) return;
     const k = (e.key || '').toLowerCase();
-    if (k === 's') {{
-      e.preventDefault();
-      e.stopPropagation();
-      saveActive();
-    }} else if (k === 'o') {{
-      e.preventDefault();
-      e.stopPropagation();
-      try {{ window.ipc.postMessage('open-dialog'); }} catch(_) {{}}
-    }} else if (k === 'z' && !e.shiftKey) {{
-      e.preventDefault();
-      e.stopPropagation();
-      doUndo();
-    }} else if (k === 'y' || k === 'r' || (k === 'z' && e.shiftKey)) {{
-      e.preventDefault();
-      e.stopPropagation();
-      doRedo();
-    }} else if (k === 'b') {{
-      e.preventDefault();
-      e.stopPropagation();
-      runMdAction('bold');
-    }} else if (k === 'i') {{
-      e.preventDefault();
-      e.stopPropagation();
-      runMdAction('italic');
-    }} else if (k === 'k') {{
-      e.preventDefault();
-      e.stopPropagation();
-      runMdAction('link');
-    }}
+    const shift = e.shiftKey;
+    const alt = e.altKey;
+    const stop = () => {{ e.preventDefault(); e.stopPropagation(); }};
+
+    // Save / Open
+    if (!shift && !alt && k === 's') {{ stop(); saveActive(); return; }}
+    if (!shift && !alt && k === 'o') {{ stop(); try {{ window.ipc.postMessage('open-dialog'); }} catch(_) {{}} return; }}
+
+    // Undo / Redo
+    if (!shift && !alt && k === 'z') {{ stop(); doUndo(); return; }}
+    if (!alt && (k === 'y' || k === 'r' || (shift && k === 'z'))) {{ stop(); doRedo(); return; }}
+
+    // Headings (Ctrl+1/2/3)
+    if (!shift && !alt && k === '1') {{ stop(); runMdAction('h1'); return; }}
+    if (!shift && !alt && k === '2') {{ stop(); runMdAction('h2'); return; }}
+    if (!shift && !alt && k === '3') {{ stop(); runMdAction('h3'); return; }}
+
+    // Bold / Italic
+    if (!shift && !alt && k === 'b') {{ stop(); runMdAction('bold'); return; }}
+    if (!shift && !alt && k === 'i') {{ stop(); runMdAction('italic'); return; }}
+    if (shift && !alt && k === 'i') {{ stop(); runMdAction('image'); return; }}
+
+    // Strikethrough
+    if (shift && !alt && k === 'x') {{ stop(); runMdAction('strike'); return; }}
+
+    // Code / Code block
+    if (!shift && !alt && k === 'e') {{ stop(); runMdAction('code'); return; }}
+    if (shift && !alt && k === 'e') {{ stop(); runMdAction('codeblock'); return; }}
+
+    // Quote
+    if (!shift && !alt && k === 'q') {{ stop(); runMdAction('quote'); return; }}
+
+    // Lists
+    if (!shift && !alt && k === 'l') {{ stop(); runMdAction('ul'); return; }}
+    if (shift && !alt && k === 'l') {{ stop(); runMdAction('ol'); return; }}
+    if (!shift && !alt && k === 't') {{ stop(); runMdAction('task'); return; }}
+
+    // Link
+    if (!shift && !alt && k === 'k') {{ stop(); runMdAction('link'); return; }}
+
+    // Table / Horizontal rule
+    if (shift && !alt && k === 'm') {{ stop(); runMdAction('table'); return; }}
+    if (shift && !alt && k === 'h') {{ stop(); runMdAction('hr'); return; }}
   }}, true);
 
   const dropOpenBtn = document.getElementById('dropOpenBtn');
