@@ -1994,6 +1994,15 @@ body {{
   transition: background .1s, color .1s;
 }}
 .tree-item:hover {{ background: var(--accent-light); color: var(--fg); }}
+.tree-item.preview-active:not(.active) {{
+  background: rgba(127, 127, 127, 0.22);
+  color: var(--fg);
+}}
+@media (prefers-color-scheme: dark) {{
+  .tree-item.preview-active:not(.active) {{
+    background: rgba(255, 255, 255, 0.12);
+  }}
+}}
 .tree-item.active {{
   background: var(--accent-light);
   color: var(--accent);
@@ -2726,6 +2735,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
   const docOrder = [];
   let activeId = null;
   let previewId = null;
+  let lastPermanentId = null;
   let mode = 'view';
   let renderTimer = null;
 
@@ -2826,6 +2836,17 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (mode === 'split') highlightCursorBlock();
   }}
 
+  // Cached version: take pre-enhanced HTML (already wrapped code blocks) and
+  // skip the heavy DOM-mutation pass — just rebind the copy buttons.
+  function setPreviewHtmlCached(cached, preserveScroll) {{
+    const prev = preserveScroll ? mainScroll.scrollTop : 0;
+    previewContainer.innerHTML = cached;
+    previewContainer.querySelectorAll('.code-wrapper').forEach(bindCopyButton);
+    if (mode === 'view') buildTOC();
+    if (preserveScroll) mainScroll.scrollTop = prev;
+    if (mode === 'split') highlightCursorBlock();
+  }}
+
   function showEmptyState() {{
     activeId = null;
     contentArea.classList.add('no-doc');
@@ -2841,6 +2862,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     const doc = docs.get(id);
     if (!doc) return;
     activeId = id;
+    if (!doc.isPreview) lastPermanentId = id;
     contentArea.classList.remove('no-doc');
     modeGroup.classList.remove('disabled');
     dropZone.style.display = 'none';
@@ -2848,12 +2870,19 @@ summary {{ cursor: pointer; font-weight: 600; }}
     updateWindowTitle(doc.name);
     renderTabBar();
     if (editorTA.value !== doc.markdown) editorTA.value = doc.markdown;
-    setPreviewHtml(doc.htmlBody, false);
+    if (doc.enhancedHtml) {{
+      setPreviewHtmlCached(doc.enhancedHtml, false);
+    }} else {{
+      setPreviewHtml(doc.htmlBody, false);
+      doc.enhancedHtml = previewContainer.innerHTML;
+    }}
     if (mode === 'edit') editorTA.focus();
-    // Preview tabs intentionally do NOT refresh the file tree — the tree
-    // stays anchored to the last permanent doc so users keep their navigation
-    // context while quickly previewing files.
-    if (sidebarPane === 'files' && !doc.isPreview) requestFileTree();
+    if (sidebarPane === 'files') {{
+      // Permanent switch may need re-scan (different baseDir);
+      // preview only updates the gray highlight on existing tree.
+      if (!doc.isPreview) requestFileTree();
+      else renderFileTree();
+    }}
   }}
 
   function closeDoc(id) {{
@@ -2873,6 +2902,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (!docs.has(id)) return;
     docs.delete(id);
     if (previewId === id) previewId = null;
+    if (lastPermanentId === id) lastPermanentId = null;
     const idx = docOrder.indexOf(id);
     if (idx >= 0) docOrder.splice(idx, 1);
     try {{ window.ipc.postMessage('close-tab:' + id); }} catch(_) {{}}
@@ -2885,6 +2915,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
       switchTo(nextId);
     }} else {{
       renderTabBar();
+      if (sidebarPane === 'files') renderFileTree();
     }}
   }}
 
@@ -2946,6 +2977,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     doc.baseDir = decB64(baseB64);
     doc.markdown = decB64(mdB64);
     doc.htmlBody = decB64(htmlB64);
+    doc.enhancedHtml = null;
     doc.dirty = false;
     // Replacement keeps preview-ness; it's still a preview tab unless promoted.
     setBaseHref(doc.baseDir);
@@ -2956,9 +2988,14 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }} else {{
       if (editorTA.value !== doc.markdown) editorTA.value = doc.markdown;
       setPreviewHtml(doc.htmlBody, false);
+      doc.enhancedHtml = previewContainer.innerHTML;
     }}
-    // Preview replacements never disturb the file tree.
-    if (sidebarPane === 'files' && !doc.isPreview) requestFileTree();
+    // Preview replacement: don't re-scan, but re-render so the gray highlight
+    // follows the new file. Permanent replacement may need re-scan.
+    if (sidebarPane === 'files') {{
+      if (!doc.isPreview) requestFileTree();
+      else renderFileTree();
+    }}
   }}
 
   function promoteToPermanent(id) {{
@@ -2993,8 +3030,14 @@ summary {{ cursor: pointer; font-weight: 600; }}
   function applyRender(id, htmlB64) {{
     const html = decB64(htmlB64);
     const doc = docs.get(id);
-    if (doc) doc.htmlBody = html;
-    if (activeId === id) setPreviewHtml(html, true);
+    if (doc) {{
+      doc.htmlBody = html;
+      doc.enhancedHtml = null;
+    }}
+    if (activeId === id) {{
+      setPreviewHtml(html, true);
+      if (doc) doc.enhancedHtml = previewContainer.innerHTML;
+    }}
   }}
 
   function setMode(m) {{
@@ -3018,9 +3061,36 @@ summary {{ cursor: pointer; font-weight: 600; }}
   const copySvg = '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>';
   const checkSvg = '<svg viewBox="0 0 24 24"><polyline points="4 12 9 17 20 6"/></svg>';
 
+  function bindCopyButton(wrapper) {{
+    const btn = wrapper.querySelector('.copy-btn');
+    if (!btn || btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', () => {{
+      const raw = wrapper.dataset.raw || '';
+      const ta = document.createElement('textarea');
+      ta.value = raw;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      btn.classList.add('copied');
+      btn.innerHTML = checkSvg;
+      setTimeout(() => {{
+        btn.classList.remove('copied');
+        btn.innerHTML = copySvg;
+      }}, 1500);
+    }});
+  }}
+
   function enhanceCodeBlocks(root) {{
     root.querySelectorAll('.syntect-block').forEach(block => {{
-      if (block.parentElement && block.parentElement.classList.contains('code-wrapper')) return;
+      if (block.parentElement && block.parentElement.classList.contains('code-wrapper')) {{
+        // Already wrapped (e.g., restored from cached innerHTML) — just rebind.
+        bindCopyButton(block.parentElement);
+        return;
+      }}
       const pre = block.querySelector('pre');
       if (!pre) return;
       const langName = block.getAttribute('data-lang') || '';
@@ -3028,6 +3098,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 
       const wrapper = document.createElement('div');
       wrapper.className = 'code-wrapper';
+      wrapper.dataset.raw = rawText;
       block.parentNode.insertBefore(wrapper, block);
 
       const header = document.createElement('div');
@@ -3071,22 +3142,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
       pre.appendChild(table);
       wrapper.appendChild(block);
 
-      btn.addEventListener('click', () => {{
-        const ta = document.createElement('textarea');
-        ta.value = rawText;
-        ta.style.position = 'fixed';
-        ta.style.left = '-9999px';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        btn.classList.add('copied');
-        btn.innerHTML = checkSvg;
-        setTimeout(() => {{
-          btn.classList.remove('copied');
-          btn.innerHTML = copySvg;
-        }}, 1500);
-      }});
+      bindCopyButton(wrapper);
     }});
   }}
 
@@ -3240,15 +3296,35 @@ summary {{ cursor: pointer; font-weight: 600; }}
     renderFileTree();
   }}
 
-  function activeFileRelPath() {{
-    if (activeId === null) return '';
-    const doc = docs.get(activeId);
-    if (!doc) return '';
-    // Preview tabs should not "navigate" the tree highlight — only permanent
-    // tabs mark the corresponding file as active in the tree.
-    if (doc.isPreview) return '';
-    if (doc.baseDir === currentTreeBase) return doc.name;
+  function docRelPathInTree(doc) {{
+    if (!doc || !currentTreeBase) return '';
+    const full = (doc.baseDir + '/' + doc.name).replace(/\\/g, '/').replace(/\/+/g, '/');
+    const baseRaw = currentTreeBase.replace(/\\/g, '/').replace(/\/+/g, '/');
+    const base = baseRaw.endsWith('/') ? baseRaw : baseRaw + '/';
+    if (full.toLowerCase().startsWith(base.toLowerCase())) {{
+      return full.slice(base.length);
+    }}
     return '';
+  }}
+
+  // Blue highlight: the most recently switched-to PERMANENT doc.
+  function permanentHighlightRelPath() {{
+    let pid = null;
+    if (activeId !== null) {{
+      const d = docs.get(activeId);
+      if (d && !d.isPreview) pid = activeId;
+    }}
+    if (pid === null) pid = lastPermanentId;
+    if (pid === null) return '';
+    return docRelPathInTree(docs.get(pid));
+  }}
+
+  // Gray highlight: preview tab's file, but ONLY while the preview tab is the
+  // currently active one. Switching back to a permanent tab clears the gray.
+  function previewHighlightRelPath() {{
+    if (previewId === null) return '';
+    if (activeId !== previewId) return '';
+    return docRelPathInTree(docs.get(previewId));
   }}
 
   const chevronSvg = '<svg viewBox="0 0 8 8"><polyline points="2 1 6 4 2 7"/></svg>';
@@ -3304,9 +3380,10 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }}
     const tree = buildTreeFromPaths(currentFiles);
     const filter = treeFilter.toLowerCase();
-    const activeRel = activeFileRelPath();
+    const activeRel = permanentHighlightRelPath();
+    const previewRel = previewHighlightRelPath();
     const frag = document.createDocumentFragment();
-    renderNodeChildren(tree, frag, 0, filter, activeRel);
+    renderNodeChildren(tree, frag, 0, filter, activeRel, previewRel);
     if (frag.childNodes.length === 0) {{
       const empty = document.createElement('div');
       empty.className = 'tree-empty';
@@ -3317,7 +3394,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }}
   }}
 
-  function renderNodeChildren(node, container, depth, filter, activeRel) {{
+  function renderNodeChildren(node, container, depth, filter, activeRel, previewRel) {{
     // Sort: folders first, then files; both alphabetic
     const arr = Array.from(node.children.values()).sort((a, b) => {{
       if (a.isFile !== b.isFile) return a.isFile ? 1 : -1;
@@ -3333,6 +3410,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         item.className = 'tree-item';
         item.style.paddingLeft = padLeft + 'px';
         if (child.fullPath === activeRel) item.classList.add('active');
+        else if (child.fullPath === previewRel) item.classList.add('preview-active');
         item.innerHTML =
           '<span class="chevron"></span>' +
           '<span class="tree-icon">' + fileSvg + '</span>' +
@@ -3375,7 +3453,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         el.appendChild(item);
         const sub = document.createElement('div');
         sub.className = 'tree-children';
-        renderNodeChildren(child, sub, depth + 1, filter, activeRel);
+        renderNodeChildren(child, sub, depth + 1, filter, activeRel, previewRel);
         el.appendChild(sub);
       }}
       container.appendChild(el);
