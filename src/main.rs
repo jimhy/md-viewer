@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+use percent_encoding::percent_decode_str;
 use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
 use std::cell::RefCell;
 use std::env;
@@ -7,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use syntect::highlighting::ThemeSet;
 use syntect::html::highlighted_html_for_string;
 use syntect::parsing::SyntaxSet;
@@ -20,6 +21,9 @@ use wry::WebViewBuilder;
 #[derive(Debug, Clone)]
 enum UserEvent {
     OpenFile(PathBuf),
+    /// Tick from the file-watch thread asking the main loop to compare each
+    /// open doc's on-disk mtime against the cached one.
+    CheckFiles,
 }
 
 struct Doc {
@@ -28,6 +32,27 @@ struct Doc {
     name: String,
     base_dir: String,
     markdown: String,
+    /// Last observed mtime for `path` (None = unknown / unreadable). Used to
+    /// detect external edits so we can refresh the rendered view.
+    mtime: Option<SystemTime>,
+}
+
+fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Convert a `file:` URL emitted by the WebView (e.g. when an `<a href>` is
+/// resolved against the `<base href="file:///F:/.../">`) back into a local
+/// path. Strips `?`/`#`, percent-decodes, and trims the bonus leading slash
+/// that precedes Windows drive letters in `file:///C:/...`.
+fn file_url_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri
+        .strip_prefix("file:///")
+        .or_else(|| uri.strip_prefix("file://"))?;
+    let path_part = rest.split(['?', '#']).next().unwrap_or(rest);
+    let decoded = percent_decode_str(path_part).decode_utf8_lossy().into_owned();
+    // file:///C:/foo -> "C:/foo"; file://server/share -> "server/share".
+    Some(PathBuf::from(decoded.replace('/', "\\")))
 }
 
 struct AppState {
@@ -61,6 +86,7 @@ impl AppState {
             }
         }
         let markdown = fs::read_to_string(path).ok()?;
+        let mtime = file_mtime(&normalized);
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -77,6 +103,7 @@ impl AppState {
             name,
             base_dir,
             markdown,
+            mtime,
         });
         Some(OpenResult { id, is_new: true })
     }
@@ -105,11 +132,13 @@ impl AppState {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         let normalized = canonical_or_keep(path);
+        let mtime = file_mtime(&normalized);
         if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
             d.path = normalized;
             d.name = name;
             d.base_dir = base_dir;
             d.markdown = markdown;
+            d.mtime = mtime;
             return true;
         }
         false
@@ -117,6 +146,14 @@ impl AppState {
 
     fn remove(&mut self, id: u64) {
         self.docs.retain(|d| d.id != id);
+    }
+
+    /// Refresh the cached mtime for `id` from disk. Call after a self-write so
+    /// the file-watcher doesn't mistake our own save for an external edit.
+    fn refresh_mtime(&mut self, id: u64) {
+        if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
+            d.mtime = file_mtime(&d.path);
+        }
     }
 }
 
@@ -163,6 +200,16 @@ fn main() {
         let proxy = event_loop.create_proxy();
         let pipe_name_owned = pipe_name.clone();
         thread::spawn(move || run_pipe_server(pipe_name_owned, proxy));
+    }
+    {
+        // Periodically ask the main loop to scan open docs for external edits.
+        let proxy = event_loop.create_proxy();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(1500));
+            if proxy.send_event(UserEvent::CheckFiles).is_err() {
+                break;
+            }
+        });
     }
 
     let monitor = event_loop
@@ -230,6 +277,19 @@ fn main() {
         .with_navigation_handler(move |uri| {
             if uri.starts_with("http://") || uri.starts_with("https://") {
                 let _ = open::that(&uri);
+                return false;
+            }
+            // The shell page is loaded via with_html, so the only file:// URIs
+            // we see come from clicking real links inside rendered markdown.
+            // .md links are routed to the IPC handler by the JS click delegate;
+            // anything else we hand off to the OS so the WebView doesn't
+            // navigate away from our SPA.
+            if uri.starts_with("file:") {
+                if let Some(p) = file_url_to_path(&uri) {
+                    let _ = open::that(p);
+                } else {
+                    let _ = open::that(&uri);
+                }
                 return false;
             }
             true
@@ -323,6 +383,16 @@ fn main() {
                         ShowWindow(hwnd, 9); // SW_RESTORE
                     }
                     SetForegroundWindow(hwnd);
+                }
+            }
+            WinEvent::UserEvent(UserEvent::CheckFiles) => {
+                let scripts = scan_external_changes(&state_for_loop);
+                if !scripts.is_empty() {
+                    if let Some(wv) = webview_for_loop.borrow().as_ref() {
+                        for script in scripts {
+                            let _ = wv.evaluate_script(&script);
+                        }
+                    }
                 }
             }
             WinEvent::WindowEvent {
@@ -450,7 +520,10 @@ fn handle_ipc(
                                 6 => {
                                     // IDYES: save then close
                                     if fs::write(&path, &markdown).is_ok() {
-                                        state.borrow_mut().update_markdown(id, markdown);
+                                        let mut s = state.borrow_mut();
+                                        s.update_markdown(id, markdown);
+                                        s.refresh_mtime(id);
+                                        drop(s);
                                         if let Some(wv) = webview.borrow().as_ref() {
                                             let _ = wv.evaluate_script(&format!(
                                                 "window.mdv && mdv.confirmCloseTab({});",
@@ -516,7 +589,9 @@ fn handle_ipc(
                     let path = state.borrow().find(*id).map(|d| d.path.clone());
                     if let Some(p) = path {
                         if fs::write(&p, md).is_ok() {
-                            state.borrow_mut().update_markdown(*id, md.clone());
+                            let mut s = state.borrow_mut();
+                            s.update_markdown(*id, md.clone());
+                            s.refresh_mtime(*id);
                         } else {
                             all_ok = false;
                             failed_id = Some(*id);
@@ -766,7 +841,11 @@ fn handle_ipc(
                         };
                         if let Some(path) = path_opt {
                             if fs::write(&path, &markdown).is_ok() {
-                                state.borrow_mut().update_markdown(id, markdown);
+                                {
+                                    let mut s = state.borrow_mut();
+                                    s.update_markdown(id, markdown);
+                                    s.refresh_mtime(id);
+                                }
                                 let script = format!("window.mdv && mdv.markSaved({});", id);
                                 if let Some(wv) = webview.borrow().as_ref() {
                                     let _ = wv.evaluate_script(&script);
@@ -1144,6 +1223,53 @@ fn ask_save_dialog(owner: isize, text: &str, caption: &str) -> i32 {
             3 | 0x30 | 0x4_0000,
         )
     }
+}
+
+/// For every open doc, compare on-disk mtime against the cached one. When a
+/// file was changed externally, re-read it, refresh the cached copy, and emit
+/// a JS call asking the front-end to reload (the front-end decides what to do
+/// when the tab has unsaved edits).
+fn scan_external_changes(state: &Rc<RefCell<AppState>>) -> Vec<String> {
+    let ids: Vec<u64> = state.borrow().docs.iter().map(|d| d.id).collect();
+    let mut scripts: Vec<String> = Vec::new();
+    for id in ids {
+        let (path, prev_mtime) = match state.borrow().docs.iter().find(|d| d.id == id) {
+            Some(d) => (d.path.clone(), d.mtime),
+            None => continue,
+        };
+        let cur_mtime = file_mtime(&path);
+        if cur_mtime == prev_mtime {
+            continue;
+        }
+        // Bump the cached mtime even on read failures so we don't spin on a
+        // permanently-broken file. Only emit a reload when we got new bytes.
+        let new_md = fs::read_to_string(&path).ok();
+        let payload = {
+            let mut s = state.borrow_mut();
+            let doc = match s.docs.iter_mut().find(|d| d.id == id) {
+                Some(d) => d,
+                None => continue,
+            };
+            doc.mtime = cur_mtime;
+            match new_md {
+                Some(md) if md != doc.markdown => {
+                    doc.markdown = md.clone();
+                    Some((md, doc.base_dir.clone()))
+                }
+                _ => None,
+            }
+        };
+        if let Some((md, base_dir)) = payload {
+            let html_body = render_markdown_body(&md, &base_dir);
+            scripts.push(format!(
+                "window.mdv && mdv.externalReload({}, '{}', '{}');",
+                id,
+                base64_encode(md.as_bytes()),
+                base64_encode(html_body.as_bytes()),
+            ));
+        }
+    }
+    scripts
 }
 
 fn parse_dirty_list(data: &str) -> Vec<(u64, String)> {
@@ -3040,6 +3166,24 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }}
   }}
 
+  // Reload triggered by an external file change detected by the host. Skip
+  // when the tab has unsaved edits so we don't clobber the user's work.
+  function externalReload(id, mdB64, htmlB64) {{
+    const doc = docs.get(id);
+    if (!doc) return;
+    if (doc.dirty) return;
+    const newMd = decB64(mdB64);
+    const newHtml = decB64(htmlB64);
+    doc.markdown = newMd;
+    doc.htmlBody = newHtml;
+    doc.enhancedHtml = null;
+    if (activeId === id) {{
+      if (editorTA.value !== newMd) editorTA.value = newMd;
+      setPreviewHtml(newHtml, true);
+      doc.enhancedHtml = previewContainer.innerHTML;
+    }}
+  }}
+
   function setMode(m) {{
     if (m !== 'view' && m !== 'edit' && m !== 'split') return;
     mode = m;
@@ -4133,6 +4277,32 @@ summary {{ cursor: pointer; font-weight: 600; }}
       requestAnimationFrame(() => {{ scrollLock = false; }});
     }}
   }}
+  // Intercept clicks on rendered <a> tags. Local .md/.markdown links open as
+  // preview tabs inside the app; everything else falls through to the
+  // navigation handler (which routes http(s) to the OS browser and other
+  // file:// targets to the default OS opener).
+  previewContainer.addEventListener('click', (e) => {{
+    const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+    if (!a) return;
+    const rawHref = a.getAttribute('href') || '';
+    if (!rawHref || rawHref.startsWith('#')) return;
+    if (/^(https?:|mailto:|tel:|javascript:)/i.test(rawHref)) return;
+    const abs = a.href || '';
+    if (!/^file:/i.test(abs)) return;
+    let urlObj;
+    try {{ urlObj = new URL(abs); }} catch (_) {{ return; }}
+    let pathname = urlObj.pathname || '';
+    try {{ pathname = decodeURIComponent(pathname); }} catch (_) {{}}
+    let localPath = pathname;
+    // file:///F:/foo/bar.md -> "/F:/foo/bar.md"; drop the leading slash so we
+    // hand Rust a native "F:/foo/bar.md".
+    if (/^\/[A-Za-z]:[\/\\]/.test(localPath)) localPath = localPath.slice(1);
+    const lower = localPath.toLowerCase();
+    if (!(lower.endsWith('.md') || lower.endsWith('.markdown'))) return;
+    e.preventDefault();
+    try {{ window.ipc.postMessage('open-path-preview:' + encB64(localPath)); }} catch (_) {{}}
+  }});
+
   editorTA.addEventListener('click', syncPreviewFromCursor);
   editorTA.addEventListener('keyup', (e) => {{
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight'
@@ -4167,6 +4337,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     addDocPreview: addDocPreview,
     replaceDoc: replaceDoc,
     applyRender: applyRender,
+    externalReload: externalReload,
     applyFileTree: applyFileTree,
     pasteImageInserted: pasteImageInserted,
     markSaved: markSaved,
