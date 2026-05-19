@@ -32,9 +32,14 @@ struct Doc {
     name: String,
     base_dir: String,
     markdown: String,
-    /// Last observed mtime for `path` (None = unknown / unreadable). Used to
-    /// detect external edits so we can refresh the rendered view.
+    /// Last observed mtime for `path` (None = unknown / unreadable). The file
+    /// watcher updates this on every scan so it can detect new external edits.
     mtime: Option<SystemTime>,
+    /// Latest mtime the user has either written themselves (via save) or
+    /// acknowledged via the "reload disk / keep mine" banner. The save
+    /// pathway uses this to decide whether to warn before overwriting an
+    /// externally-modified file.
+    acknowledged_mtime: Option<SystemTime>,
 }
 
 fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
@@ -104,6 +109,7 @@ impl AppState {
             base_dir,
             markdown,
             mtime,
+            acknowledged_mtime: mtime,
         });
         Some(OpenResult { id, is_new: true })
     }
@@ -139,6 +145,7 @@ impl AppState {
             d.base_dir = base_dir;
             d.markdown = markdown;
             d.mtime = mtime;
+            d.acknowledged_mtime = mtime;
             return true;
         }
         false
@@ -149,10 +156,21 @@ impl AppState {
     }
 
     /// Refresh the cached mtime for `id` from disk. Call after a self-write so
-    /// the file-watcher doesn't mistake our own save for an external edit.
+    /// the file-watcher doesn't mistake our own save for an external edit, and
+    /// so the next save passes the conflict check.
     fn refresh_mtime(&mut self, id: u64) {
         if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
-            d.mtime = file_mtime(&d.path);
+            let m = file_mtime(&d.path);
+            d.mtime = m;
+            d.acknowledged_mtime = m;
+        }
+    }
+
+    /// Mark the latest observed mtime as user-acknowledged. Invoked when the
+    /// user clicks "reload disk" or "keep mine" on the conflict banner.
+    fn acknowledge_external(&mut self, id: u64) {
+        if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
+            d.acknowledged_mtime = d.mtime;
         }
     }
 }
@@ -504,6 +522,13 @@ fn handle_ipc(
         return;
     }
 
+    if let Some(id_str) = body.strip_prefix("ack-external:") {
+        if let Ok(id) = id_str.parse::<u64>() {
+            state.borrow_mut().acknowledge_external(id);
+        }
+        return;
+    }
+
     if let Some(rest) = body.strip_prefix("confirm-close-tab:") {
         if let Some((id_str, md_b64)) = rest.split_once(':') {
             if let Ok(id) = id_str.parse::<u64>() {
@@ -835,11 +860,37 @@ fn handle_ipc(
             if let Ok(id) = id_str.parse::<u64>() {
                 if let Ok(md_bytes) = base64_decode(md_b64) {
                     if let Ok(markdown) = String::from_utf8(md_bytes) {
-                        let path_opt = {
+                        let info = {
                             let s = state.borrow();
-                            s.find(id).map(|d| d.path.clone())
+                            s.find(id).map(|d| (d.path.clone(), d.name.clone(), d.acknowledged_mtime))
                         };
-                        if let Some(path) = path_opt {
+                        if let Some((path, name, ack_mtime)) = info {
+                            // Conflict check: if the file on disk is newer than
+                            // what the user has acknowledged, ask before
+                            // clobbering it.
+                            let disk_mtime = file_mtime(&path);
+                            let differs = match (disk_mtime, ack_mtime) {
+                                (Some(a), Some(b)) => a != b,
+                                (None, None) => false,
+                                _ => true,
+                            };
+                            if differs && ack_mtime.is_some() {
+                                let prompt = format!(
+                                    "「{}」 在磁盘上已被外部修改。\n\n是否用编辑器中的内容覆盖磁盘？\n（选择「否」取消保存）",
+                                    name
+                                );
+                                let answer = ask_yesno_dialog(hwnd, &prompt, "MD Viewer");
+                                if answer != 6 {
+                                    // IDNO or dialog closed: cancel save.
+                                    if let Some(wv) = webview.borrow().as_ref() {
+                                        let _ = wv.evaluate_script(&format!(
+                                            "window.mdv && mdv.saveCancelled({});",
+                                            id
+                                        ));
+                                    }
+                                    return;
+                                }
+                            }
                             if fs::write(&path, &markdown).is_ok() {
                                 {
                                     let mut s = state.borrow_mut();
@@ -1204,6 +1255,24 @@ fn scan_md_files(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<St
                 }
             }
         }
+    }
+}
+
+fn ask_yesno_dialog(owner: isize, text: &str, caption: &str) -> i32 {
+    let wide_text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_caption: Vec<u16> = caption.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, typ: u32) -> i32;
+        }
+        // MB_YESNO(4) | MB_ICONWARNING(0x30) | MB_TOPMOST(0x40000)
+        MessageBoxW(
+            owner,
+            wide_text.as_ptr(),
+            wide_caption.as_ptr(),
+            4 | 0x30 | 0x4_0000,
+        )
     }
 }
 
@@ -1878,6 +1947,53 @@ body {{
 }}
 .tab-bar::-webkit-scrollbar {{ height: 0; display: none; }}
 .tab-bar.empty {{ display: none; }}
+
+/* External-change banner: shown when a dirty tab's file is modified on disk. */
+.reload-banner {{
+  display: none;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 8px 0 8px;
+  padding: 7px 12px;
+  background: #fff7d6;
+  border: 1px solid #e0c870;
+  border-radius: 6px;
+  color: #6b4e00;
+  font-size: 13px;
+  flex-shrink: 0;
+}}
+.reload-banner.show {{ display: flex; }}
+.reload-banner-icon {{ font-size: 15px; }}
+.reload-banner-msg {{ flex: 1; }}
+.reload-banner-btn {{
+  height: 26px;
+  padding: 0 10px;
+  background: rgba(255,255,255,0.6);
+  border: 1px solid rgba(0,0,0,0.12);
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}}
+.reload-banner-btn:hover {{ background: rgba(255,255,255,0.9); }}
+.reload-banner-btn.primary {{
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}}
+.reload-banner-btn.primary:hover {{ filter: brightness(1.08); }}
+@media (prefers-color-scheme: dark) {{
+  .reload-banner {{
+    background: #3a2f14;
+    border-color: #7a5d20;
+    color: #f0d68a;
+  }}
+  .reload-banner-btn {{
+    background: rgba(0,0,0,0.25);
+    border-color: rgba(255,255,255,0.12);
+  }}
+  .reload-banner-btn:hover {{ background: rgba(0,0,0,0.4); }}
+}}
 .tab {{
   flex-shrink: 0;
   min-width: 100px;
@@ -2740,6 +2856,13 @@ summary {{ cursor: pointer; font-weight: 600; }}
 
 <div class="tab-bar empty" id="tabBar"></div>
 
+<div class="reload-banner" id="reloadBanner">
+  <span class="reload-banner-icon">⚠</span>
+  <span class="reload-banner-msg">该文件已被外部修改</span>
+  <button class="reload-banner-btn" id="reloadBannerKeep" type="button">保留我的</button>
+  <button class="reload-banner-btn primary" id="reloadBannerLoad" type="button">重载磁盘</button>
+</div>
+
 <div class="slash-popup" id="slashPopup" hidden></div>
 
 <div class="content-area no-doc" id="contentArea">
@@ -2879,6 +3002,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
   const tocResizer = document.getElementById('tocResizer');
   const splitResizer = document.getElementById('splitResizer');
   const editorPane = document.getElementById('editorPane');
+  const reloadBanner = document.getElementById('reloadBanner');
+  const reloadBannerKeep = document.getElementById('reloadBannerKeep');
+  const reloadBannerLoad = document.getElementById('reloadBannerLoad');
 
   function decB64(b64) {{
     if (!b64) return '';
@@ -2982,6 +3108,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     editorTA.value = '';
     updateWindowTitle(null);
     renderTabBar();
+    updateReloadBanner();
   }}
 
   function switchTo(id) {{
@@ -2995,6 +3122,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     setBaseHref(doc.baseDir);
     updateWindowTitle(doc.name);
     renderTabBar();
+    updateReloadBanner();
     if (editorTA.value !== doc.markdown) editorTA.value = doc.markdown;
     if (doc.enhancedHtml) {{
       setPreviewHtmlCached(doc.enhancedHtml, false);
@@ -3067,10 +3195,11 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (docs.has(id)) {{
       const d = docs.get(id);
       d.name = name; d.baseDir = baseDir; d.markdown = markdown; d.htmlBody = htmlBody;
+      d.savedMarkdown = markdown;
       d.dirty = false;
       d.isPreview = false;
     }} else {{
-      docs.set(id, {{id, name, baseDir, markdown, htmlBody, dirty: false, isPreview: false}});
+      docs.set(id, {{id, name, baseDir, markdown, htmlBody, savedMarkdown: markdown, dirty: false, isPreview: false}});
       docOrder.push(id);
     }}
     if (makeActive) switchTo(id);
@@ -3090,7 +3219,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
       if (idx >= 0) docOrder.splice(idx, 1);
       try {{ window.ipc.postMessage('close-tab:' + old); }} catch(_) {{}}
     }}
-    docs.set(id, {{id, name, baseDir, markdown, htmlBody, dirty: false, isPreview: true}});
+    docs.set(id, {{id, name, baseDir, markdown, htmlBody, savedMarkdown: markdown, dirty: false, isPreview: true}});
     if (!docOrder.includes(id)) docOrder.push(id);
     previewId = id;
     switchTo(id);
@@ -3103,6 +3232,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     doc.baseDir = decB64(baseB64);
     doc.markdown = decB64(mdB64);
     doc.htmlBody = decB64(htmlB64);
+    doc.savedMarkdown = doc.markdown;
     doc.enhancedHtml = null;
     doc.dirty = false;
     // Replacement keeps preview-ness; it's still a preview tab unless promoted.
@@ -3136,20 +3266,46 @@ summary {{ cursor: pointer; font-weight: 600; }}
   function markSaved(id) {{
     const doc = docs.get(id);
     if (!doc) return;
-    doc.dirty = false;
+    // Use the snapshot taken at save-time so any keystrokes that landed while
+    // the host was writing to disk still keep the tab marked dirty.
+    if (doc.pendingSaveSnapshot !== undefined) {{
+      doc.savedMarkdown = doc.pendingSaveSnapshot;
+      doc.pendingSaveSnapshot = undefined;
+    }} else {{
+      doc.savedMarkdown = doc.markdown;
+    }}
+    doc.dirty = (doc.markdown !== doc.savedMarkdown);
+    // Save succeeded: disk now matches us, drop any stashed external version.
+    delete doc.externalMd;
+    delete doc.externalHtml;
     renderTabBar();
+    if (activeId === id) updateReloadBanner();
   }}
 
   function saveFailed(id) {{
     const doc = docs.get(id);
     if (!doc) return;
+    if (doc.pendingSaveSnapshot !== undefined) doc.pendingSaveSnapshot = undefined;
     console.warn('Save failed for doc', id, doc && doc.name);
+  }}
+
+  // Host refused the save because the file on disk has a newer version that
+  // the user hasn't acknowledged. Drop the in-flight snapshot; the banner
+  // (if any) stays up so the user can resolve the conflict.
+  function saveCancelled(id) {{
+    const doc = docs.get(id);
+    if (!doc) return;
+    if (doc.pendingSaveSnapshot !== undefined) doc.pendingSaveSnapshot = undefined;
   }}
 
   function saveActive() {{
     if (activeId === null) return;
     const doc = docs.get(activeId);
     if (!doc) return;
+    // Snapshot the exact bytes we're about to send so markSaved can compare
+    // them against doc.markdown (which may have grown between Ctrl+S and the
+    // host's write-complete callback).
+    doc.pendingSaveSnapshot = doc.markdown;
     try {{ window.ipc.postMessage('save:' + activeId + ':' + encB64(doc.markdown)); }} catch(_) {{}}
   }}
 
@@ -3166,23 +3322,85 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }}
   }}
 
-  // Reload triggered by an external file change detected by the host. Skip
-  // when the tab has unsaved edits so we don't clobber the user's work.
+  // Reload triggered by an external file change detected by the host. When
+  // the tab has unsaved edits we stash the disk version and surface a banner
+  // so the user can resolve the conflict; otherwise we apply it silently.
   function externalReload(id, mdB64, htmlB64) {{
     const doc = docs.get(id);
     if (!doc) return;
-    if (doc.dirty) return;
     const newMd = decB64(mdB64);
     const newHtml = decB64(htmlB64);
+    if (doc.dirty) {{
+      doc.externalMd = newMd;
+      doc.externalHtml = newHtml;
+      if (activeId === id) updateReloadBanner();
+      return;
+    }}
     doc.markdown = newMd;
+    doc.savedMarkdown = newMd;
     doc.htmlBody = newHtml;
     doc.enhancedHtml = null;
+    delete doc.externalMd;
+    delete doc.externalHtml;
     if (activeId === id) {{
       if (editorTA.value !== newMd) editorTA.value = newMd;
       setPreviewHtml(newHtml, true);
       doc.enhancedHtml = previewContainer.innerHTML;
+      updateReloadBanner();
     }}
   }}
+
+  function updateReloadBanner() {{
+    if (activeId === null) {{ reloadBanner.classList.remove('show'); return; }}
+    const doc = docs.get(activeId);
+    if (doc && doc.externalMd !== undefined) reloadBanner.classList.add('show');
+    else reloadBanner.classList.remove('show');
+  }}
+
+  function applyDiskVersion(doc) {{
+    const newMd = doc.externalMd;
+    const newHtml = doc.externalHtml;
+    if (newMd === undefined) return;
+    doc.markdown = newMd;
+    doc.savedMarkdown = newMd;
+    doc.htmlBody = newHtml;
+    doc.enhancedHtml = null;
+    doc.dirty = false;
+    delete doc.externalMd;
+    delete doc.externalHtml;
+    if (activeId === doc.id) {{
+      if (editorTA.value !== newMd) editorTA.value = newMd;
+      setPreviewHtml(newHtml, true);
+      doc.enhancedHtml = previewContainer.innerHTML;
+    }}
+    renderTabBar();
+    updateReloadBanner();
+    try {{ window.ipc.postMessage('ack-external:' + doc.id); }} catch (_) {{}}
+  }}
+
+  function keepLocalVersion(doc) {{
+    if (doc.externalMd === undefined) return;
+    // Treat the disk version as acknowledged; keep editor untouched. Dirty is
+    // recomputed against the new baseline so saving later overwrites disk.
+    doc.savedMarkdown = doc.externalMd;
+    delete doc.externalMd;
+    delete doc.externalHtml;
+    doc.dirty = (doc.markdown !== doc.savedMarkdown);
+    renderTabBar();
+    updateReloadBanner();
+    try {{ window.ipc.postMessage('ack-external:' + doc.id); }} catch (_) {{}}
+  }}
+
+  reloadBannerLoad.addEventListener('click', () => {{
+    if (activeId === null) return;
+    const doc = docs.get(activeId);
+    if (doc) applyDiskVersion(doc);
+  }});
+  reloadBannerKeep.addEventListener('click', () => {{
+    if (activeId === null) return;
+    const doc = docs.get(activeId);
+    if (doc) keepLocalVersion(doc);
+  }});
 
   function setMode(m) {{
     if (m !== 'view' && m !== 'edit' && m !== 'split') return;
@@ -3734,12 +3952,15 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (doc.markdown !== editorTA.value) {{
       doc.markdown = editorTA.value;
       let needTabRefresh = false;
-      if (!doc.dirty) {{
-        doc.dirty = true;
+      // Recompute dirty from the saved baseline so undoing back to the
+      // on-disk content clears the modified marker.
+      const shouldBeDirty = (doc.markdown !== (doc.savedMarkdown || ''));
+      if (doc.dirty !== shouldBeDirty) {{
+        doc.dirty = shouldBeDirty;
         needTabRefresh = true;
       }}
       let promoted = false;
-      if (doc.isPreview) {{
+      if (doc.isPreview && shouldBeDirty) {{
         doc.isPreview = false;
         if (previewId === activeId) previewId = null;
         needTabRefresh = true;
@@ -4342,6 +4563,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     pasteImageInserted: pasteImageInserted,
     markSaved: markSaved,
     saveFailed: saveFailed,
+    saveCancelled: saveCancelled,
     switchTo: switchTo,
     closeDoc: closeDoc,
     confirmCloseTab: forceCloseDoc,
@@ -4411,12 +4633,14 @@ summary {{ cursor: pointer; font-weight: 600; }}
   setMode('view');
   if (Array.isArray(INITIAL_DOCS) && INITIAL_DOCS.length > 0) {{
     for (const d of INITIAL_DOCS) {{
+      const md = decB64(d.markdown);
       docs.set(d.id, {{
         id: d.id,
         name: decB64(d.name),
         baseDir: decB64(d.baseDir),
-        markdown: decB64(d.markdown),
+        markdown: md,
         htmlBody: decB64(d.htmlBody),
+        savedMarkdown: md,
         dirty: false,
       }});
       docOrder.push(d.id);
