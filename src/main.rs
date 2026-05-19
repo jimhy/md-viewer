@@ -2569,7 +2569,6 @@ body {{
 }}
 .drop-text {{ font-size: 15px; color: var(--fg-secondary); text-align: center; line-height: 1.6; }}
 .drop-text strong {{ display: block; font-size: 17px; color: var(--fg); font-weight: 600; margin-bottom: 4px; }}
-.drop-hint {{ font-size: 12px; color: var(--fg-secondary); opacity: .6; }}
 .drop-open-btn {{
   margin-top: 8px;
   padding: 8px 18px;
@@ -2970,7 +2969,6 @@ summary {{ cursor: pointer; font-weight: 600; }}
         </div>
         <button class="drop-open-btn" id="dropOpenBtn">打开文件… (Ctrl+O)</button>
       </div>
-      <div class="drop-hint">也可以运行 install.bat 后直接双击 .md 文件打开</div>
     </div>
   </main>
 </div>

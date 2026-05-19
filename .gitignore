@@ -1,4 +1,5 @@
 /target
+/dist/
 *.exe
 *.exe.WebView2/
 debug_html*.txt
@@ -6,3 +7,4 @@ debug_html*.txt
 test.md
 test_img.md
 /qa-shots/
+.ruff_cache/
