@@ -4,8 +4,8 @@
 
 A fast, beautiful Markdown viewer **and editor** for Windows. Multi-tab, file sidebar, live preview, syntax highlighting, paste-to-save images — all in a ~3 MB native app powered by Rust + WebView2.
 
-![MD Viewer screenshot](docs/screenshot1.png)
 
+![MD Viewer screenshot](docs/screenshot1.png)
 **[⬇ Download Latest Release](../../releases/)**
 
 ## Features
