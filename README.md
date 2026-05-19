@@ -4,7 +4,7 @@
 
 A lightweight, beautiful Markdown viewer for Windows. Single portable executable, no installation required.
 
-**[Download Latest Release](/releases/latest)**
+**[Download Latest Release](/releases/)**
 
 ## Features
 
