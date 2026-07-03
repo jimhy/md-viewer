@@ -21,9 +21,13 @@ use tao::window::WindowBuilder;
 use std::sync::{Arc, Mutex};
 use wry::{PageLoadEvent, WebViewBuilder};
 
-/// GitHub repo the auto-updater queries for the latest release.
+/// Repos the auto-updater queries for the latest release. Both GitHub and Gitee
+/// are checked in parallel; whichever responds first wins (so users behind the
+/// GFW fall back to Gitee automatically).
 const GITHUB_OWNER: &str = "jimhy";
 const GITHUB_REPO: &str = "md-viewer";
+const GITEE_OWNER: &str = "jimyliu";
+const GITEE_REPO: &str = "md-viewer";
 
 #[derive(Debug, Clone)]
 enum UserEvent {
@@ -1850,8 +1854,8 @@ fn curl_path() -> PathBuf {
     PathBuf::from(root).join("System32").join("curl.exe")
 }
 
-/// Only ever fetch/download from GitHub over HTTPS. Defense in depth: the URL
-/// already originates from the GitHub API, but we re-check the scheme/host
+/// Only ever fetch/download from GitHub or Gitee over HTTPS. Defense in depth:
+/// the URL already originates from those APIs, but we re-check the scheme/host
 /// before handing it to curl so nothing else can slip through.
 fn is_trusted_update_url(url: &str) -> bool {
     let rest = match url.strip_prefix("https://") {
@@ -1865,6 +1869,8 @@ fn is_trusted_update_url(url: &str) -> bool {
     host == "github.com"
         || host == "api.github.com"
         || host.ends_with(".githubusercontent.com")
+        || host == "gitee.com"
+        || host.ends_with(".gitee.com")
 }
 
 /// HTTP GET a URL as text via the system `curl` (bundled with Windows 10 1803+),
@@ -1981,14 +1987,11 @@ fn remote_is_newer(remote: &str, local: &str) -> bool {
     }
 }
 
-/// Query GitHub for the latest release; return (version, notes, installer_url)
-/// only when it is strictly newer than the running build. Any failure → None.
-fn check_for_update() -> Option<(String, String, String)> {
-    let api = format!(
-        "https://api.github.com/repos/{}/{}/releases/latest",
-        GITHUB_OWNER, GITHUB_REPO
-    );
-    let json = curl_get_text(&api)?;
+/// Query one release API (GitHub or Gitee) for the latest release; return
+/// (version, notes, installer_url) only when it is strictly newer than the
+/// running build. Any failure → None.
+fn check_release_source(api_url: &str) -> Option<(String, String, String)> {
+    let json = curl_get_text(api_url)?;
     let tag = json_string_field(&json, "tag_name")?;
     if !remote_is_newer(&tag, env!("CARGO_PKG_VERSION")) {
         return None;
@@ -1996,6 +1999,40 @@ fn check_for_update() -> Option<(String, String, String)> {
     let url = find_installer_url(&json)?;
     let notes = json_string_field(&json, "body").unwrap_or_default();
     Some((tag, notes, url))
+}
+
+/// Check GitHub and Gitee for a newer release in parallel and use whichever
+/// responds first — so users who can't reach GitHub (GFW) transparently fall
+/// back to Gitee, and its installer URL is the one they download from.
+fn check_for_update() -> Option<(String, String, String)> {
+    let apis = [
+        format!(
+            "https://api.github.com/repos/{}/{}/releases/latest",
+            GITHUB_OWNER, GITHUB_REPO
+        ),
+        format!(
+            "https://gitee.com/api/v5/repos/{}/{}/releases/latest",
+            GITEE_OWNER, GITEE_REPO
+        ),
+    ];
+    let (tx, rx) = std::sync::mpsc::channel();
+    for api in apis {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(check_release_source(&api));
+        });
+    }
+    drop(tx);
+    // Take the first source that reports a newer version; if the fastest one
+    // came back empty (no update / unreachable), wait for the other.
+    for _ in 0..2 {
+        match rx.recv_timeout(Duration::from_secs(25)) {
+            Ok(Some(result)) => return Some(result),
+            Ok(None) => continue,
+            Err(_) => break,
+        }
+    }
+    None
 }
 
 /// Download the installer and hand off to it. On success we launch the setup
@@ -4306,7 +4343,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
   // lives on the Rust side; the UI only ever asks the host to start the update.
   let updating = false;
   function showUpdate(versionB64, notesB64) {{
-    const version = decB64(versionB64);
+    // Strip any leading v/V — GitHub tags are "1.0.18", Gitee's are "v1.0.18";
+    // normalize so the banner never shows "vv1.0.18".
+    const version = decB64(versionB64).replace(/^[vV]/, '');
     updateAvailable = true;
     updateBannerMsg.textContent = '发现新版本 v' + version + '，是否更新？';
     updateBannerMsg.title = decB64(notesB64) || '';
