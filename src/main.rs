@@ -445,11 +445,29 @@ fn main() {
         .with_drag_drop_handler(move |event| {
             if let wry::DragDropEvent::Drop { paths, .. } = event {
                 for path in paths.iter() {
-                    let is_md = path
+                    let ext = path
                         .extension()
-                        .map(|e| e == "md" || e == "markdown")
-                        .unwrap_or(false);
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let is_md = ext == "md" || ext == "markdown";
+                    let is_img = matches!(
+                        ext.as_str(),
+                        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+                    );
                     if !is_md {
+                        if is_img {
+                            // Hand the path to the front-end; it decides where to
+                            // insert based on the active doc, then posts back
+                            // `drop-image:` for the host to save into images/.
+                            let script = format!(
+                                "window.mdv && mdv.onImageDrop('{}');",
+                                base64_encode(path.to_string_lossy().as_bytes())
+                            );
+                            if let Some(wv) = webview_for_dd.borrow().as_ref() {
+                                let _ = wv.evaluate_script(&script);
+                            }
+                        }
                         continue;
                     }
                     let path_buf = path.clone();
@@ -1127,6 +1145,52 @@ fn handle_ipc(
                                 );
                                 if let Some(wv) = webview.borrow().as_ref() {
                                     let _ = wv.evaluate_script(&script);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(rest) = body.strip_prefix("drop-image:") {
+        if let Some((id_str, path_b64)) = rest.split_once(':') {
+            if let Ok(id) = id_str.parse::<u64>() {
+                if let Ok(pb) = base64_decode(path_b64) {
+                    if let Ok(path_str) = String::from_utf8(pb) {
+                        let src = PathBuf::from(&path_str);
+                        let base_dir_opt = {
+                            let s = state.borrow();
+                            s.find(id).map(|d| d.base_dir.clone())
+                        };
+                        if let Some(base_dir) = base_dir_opt {
+                            if !base_dir.is_empty() {
+                                if let Ok(data) = fs::read(&src) {
+                                    let ext = src
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .map(|e| e.to_ascii_lowercase())
+                                        .unwrap_or_else(|| detect_image_ext(&data).to_string());
+                                    let images_dir = PathBuf::from(&base_dir).join("images");
+                                    let _ = fs::create_dir_all(&images_dir);
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis();
+                                    let filename = format!("img-{}.{}", now, ext);
+                                    let full = images_dir.join(&filename);
+                                    if fs::write(&full, &data).is_ok() {
+                                        let rel_path = format!("images/{}", filename);
+                                        let script = format!(
+                                            "window.mdv && mdv.pasteImageInserted('{}');",
+                                            base64_encode(rel_path.as_bytes())
+                                        );
+                                        if let Some(wv) = webview.borrow().as_ref() {
+                                            let _ = wv.evaluate_script(&script);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2362,6 +2426,17 @@ fn render_markdown_body(markdown: &str, base_dir: &str) -> String {
                     line
                 ));
             }
+            // Task-list checkbox: render it enabled (clickable) and tag it with
+            // the exact source line so the front-end can toggle `[ ]`/`[x]` in
+            // the markdown when the user clicks it in view/split mode.
+            MdEvent::TaskListMarker(checked) => {
+                let line = byte_to_line(range.start);
+                html_body.push_str(&format!(
+                    "<input type=\"checkbox\" class=\"task-check\" data-task-line=\"{}\"{} />",
+                    line,
+                    if checked { " checked" } else { "" }
+                ));
+            }
             other => {
                 pulldown_cmark::html::push_html(&mut html_body, std::iter::once(other));
             }
@@ -2742,6 +2817,94 @@ body {{
   border-color: var(--accent);
 }}
 .mode-group.disabled {{ display: none; }}
+
+/* ===== Find / replace bar ===== */
+.find-bar {{
+  position: absolute;
+  top: 8px;
+  right: 14px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 8px;
+  background: var(--titlebar-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.14);
+}}
+@media (prefers-color-scheme: dark) {{
+  .find-bar {{ box-shadow: 0 4px 14px rgba(0,0,0,.5); }}
+}}
+.find-bar[hidden] {{ display: none; }}
+.find-row {{ display: flex; align-items: center; gap: 4px; }}
+.find-row[hidden] {{ display: none; }}
+.find-input {{
+  height: 26px;
+  width: 190px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color .12s;
+}}
+.find-input:focus {{ border-color: var(--accent); }}
+.find-count {{
+  font-size: 11.5px;
+  color: var(--fg-secondary);
+  min-width: 42px;
+  text-align: center;
+  white-space: nowrap;
+}}
+.find-btn {{
+  height: 26px;
+  min-width: 26px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .12s, color .12s;
+}}
+.find-btn:hover {{ background: var(--btn-hover); color: var(--fg); }}
+.find-btn-text {{ padding: 0 9px; }}
+
+/* Image lightbox (click a rendered image to zoom). */
+.img-lightbox {{
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(0,0,0,.82);
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}}
+.img-lightbox.show {{ display: flex; }}
+.img-lightbox img {{
+  max-width: 94vw;
+  max-height: 94vh;
+  border-radius: 4px;
+  box-shadow: 0 10px 44px rgba(0,0,0,.55);
+}}
+
+/* Search-match highlight in the rendered preview. */
+mark.find-hit {{ background: #ffe08a; color: inherit; border-radius: 2px; }}
+mark.find-hit.find-current {{ background: #ff9f43; }}
+@media (prefers-color-scheme: dark) {{
+  mark.find-hit {{ background: #6b5416; color: #fff; }}
+  mark.find-hit.find-current {{ background: #b5761a; color: #fff; }}
+}}
 
 /* ===== Window controls ===== */
 .titlebar-controls {{
@@ -3300,6 +3463,9 @@ ul, ol {{ padding-left: 1.8em; margin-bottom: 1em; }}
 li {{ margin-bottom: 0.3em; }}
 li > ul, li > ol {{ margin-bottom: 0; margin-top: 0.3em; }}
 li input[type="checkbox"] {{ margin-right: 0.5em; transform: scale(1.15); accent-color: var(--accent); }}
+li input.task-check {{ cursor: pointer; }}
+/* Hide the bullet on task-list items (GitHub style) — the checkbox stands in. */
+li:has(> input.task-check) {{ list-style: none; margin-left: -1.3em; }}
 
 code {{
   font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, monospace;
@@ -3520,6 +3686,21 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <div class="slash-popup" id="slashPopup" hidden></div>
 
 <div class="content-area no-doc" id="contentArea">
+  <div class="find-bar" id="findBar" hidden>
+    <div class="find-row">
+      <input class="find-input" id="findInput" type="text" placeholder="查找" spellcheck="false">
+      <span class="find-count" id="findCount">0/0</span>
+      <button class="find-btn" id="findPrev" type="button" title="上一个 (Shift+Enter)">&#9650;</button>
+      <button class="find-btn" id="findNext" type="button" title="下一个 (Enter)">&#9660;</button>
+      <button class="find-btn" id="findToggleReplace" type="button" title="替换 (Ctrl+H)">&#8644;</button>
+      <button class="find-btn" id="findClose" type="button" title="关闭 (Esc)">&#10005;</button>
+    </div>
+    <div class="find-row" id="findReplaceRow" hidden>
+      <input class="find-input" id="replaceInput" type="text" placeholder="替换为" spellcheck="false">
+      <button class="find-btn find-btn-text" id="replaceOne" type="button" title="替换当前">替换</button>
+      <button class="find-btn find-btn-text" id="replaceAll" type="button" title="全部替换">全部</button>
+    </div>
+  </div>
   <aside class="toc-sidebar" id="tocSidebar">
     <div class="sidebar-tabs">
       <button class="sidebar-tab active" data-pane="toc">目录</button>
@@ -3627,6 +3808,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
     </div>
   </main>
 </div>
+
+<div class="img-lightbox" id="imgLightbox"><img id="imgLightboxImg" alt=""></div>
 
 <script>
 (function() {{
@@ -4162,7 +4345,189 @@ summary {{ cursor: pointer; font-weight: 600; }}
   updateBannerDo.addEventListener('click', doUpdate);
   updateBannerLater.addEventListener('click', () => {{ if (!updating) updateBanner.classList.remove('show'); }});
 
+  // ===== Find / replace =====
+  const findBar = document.getElementById('findBar');
+  const findInput = document.getElementById('findInput');
+  const findCount = document.getElementById('findCount');
+  const findPrevBtn = document.getElementById('findPrev');
+  const findNextBtn = document.getElementById('findNext');
+  const findToggleReplace = document.getElementById('findToggleReplace');
+  const findCloseBtn = document.getElementById('findClose');
+  const findReplaceRow = document.getElementById('findReplaceRow');
+  const replaceInput = document.getElementById('replaceInput');
+  const replaceOneBtn = document.getElementById('replaceOne');
+  const replaceAllBtn = document.getElementById('replaceAll');
+  let findMatches = [];      // editor: array of start indices; preview: array of <mark>
+  let findCurrent = -1;
+  let findScope = 'editor';  // 'editor' | 'preview'
+
+  function clearPreviewHighlights() {{
+    const marks = previewContainer.querySelectorAll('mark.find-hit');
+    marks.forEach(mk => {{
+      const parent = mk.parentNode;
+      if (!parent) return;
+      parent.replaceChild(document.createTextNode(mk.textContent), mk);
+      parent.normalize();
+    }});
+  }}
+  function updateFindCount() {{
+    if (findMatches.length === 0) findCount.textContent = findInput.value ? '0/0' : '';
+    else findCount.textContent = (findCurrent + 1) + '/' + findMatches.length;
+  }}
+  function scrollEditorTo(pos) {{
+    const before = editorTA.value.slice(0, pos);
+    const lineNo = (before.match(/\n/g) || []).length;
+    const lh = parseFloat(getComputedStyle(editorTA).lineHeight) || 20;
+    const target = lineNo * lh - editorTA.clientHeight / 2;
+    editorTA.scrollTop = Math.max(0, target);
+  }}
+  function focusEditorMatch() {{
+    const q = findInput.value;
+    const start = findMatches[findCurrent];
+    editorTA.focus();
+    editorTA.setSelectionRange(start, start + q.length);
+    scrollEditorTo(start);
+  }}
+  function focusPreviewMatch() {{
+    findMatches.forEach((mk, i) => mk.classList.toggle('find-current', i === findCurrent));
+    const mk = findMatches[findCurrent];
+    if (mk) mk.scrollIntoView({{ block: 'center', behavior: 'smooth' }});
+  }}
+  function highlightPreview(query) {{
+    const q = query.toLowerCase();
+    const walker = document.createTreeWalker(previewContainer, NodeFilter.SHOW_TEXT, {{
+      acceptNode: (node) => {{
+        if (!node.nodeValue) return NodeFilter.FILTER_REJECT;
+        const p = node.parentNode;
+        if (p && (p.nodeName === 'SCRIPT' || p.nodeName === 'STYLE')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }}
+    }});
+    const textNodes = [];
+    let node;
+    while ((node = walker.nextNode())) textNodes.push(node);
+    textNodes.forEach(tn => {{
+      const text = tn.nodeValue;
+      const low = text.toLowerCase();
+      let idx = low.indexOf(q);
+      if (idx === -1) return;
+      const frag = document.createDocumentFragment();
+      let last = 0;
+      while (idx !== -1) {{
+        if (idx > last) frag.appendChild(document.createTextNode(text.slice(last, idx)));
+        const mk = document.createElement('mark');
+        mk.className = 'find-hit';
+        mk.textContent = text.slice(idx, idx + q.length);
+        frag.appendChild(mk);
+        findMatches.push(mk);
+        last = idx + q.length;
+        idx = low.indexOf(q, last);
+      }}
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      tn.parentNode.replaceChild(frag, tn);
+    }});
+  }}
+  function runFind() {{
+    clearPreviewHighlights();
+    findMatches = []; findCurrent = -1;
+    const q = findInput.value;
+    if (!q) {{ updateFindCount(); return; }}
+    if (findScope === 'editor') {{
+      const hay = editorTA.value.toLowerCase();
+      const needle = q.toLowerCase();
+      let idx = 0;
+      while ((idx = hay.indexOf(needle, idx)) !== -1) {{ findMatches.push(idx); idx += needle.length; }}
+      if (findMatches.length) {{ findCurrent = 0; focusEditorMatch(); }}
+    }} else {{
+      highlightPreview(q);
+      if (findMatches.length) {{ findCurrent = 0; focusPreviewMatch(); }}
+    }}
+    updateFindCount();
+  }}
+  function findGo(dir) {{
+    if (findMatches.length === 0) return;
+    findCurrent = (findCurrent + dir + findMatches.length) % findMatches.length;
+    if (findScope === 'editor') focusEditorMatch();
+    else focusPreviewMatch();
+    updateFindCount();
+  }}
+  function openFind(withReplace) {{
+    if (activeId === null) return;
+    findScope = (mode === 'view') ? 'preview' : 'editor';
+    findBar.hidden = false;
+    findReplaceRow.hidden = !(withReplace && findScope === 'editor');
+    let sel = '';
+    if (findScope === 'editor') sel = editorTA.value.slice(editorTA.selectionStart, editorTA.selectionEnd);
+    else sel = (window.getSelection && window.getSelection().toString()) || '';
+    if (sel && sel.indexOf('\n') === -1) findInput.value = sel;
+    findInput.focus();
+    findInput.select();
+    runFind();
+  }}
+  function closeFind() {{
+    if (findBar.hidden) return;
+    findBar.hidden = true;
+    clearPreviewHighlights();
+    findMatches = []; findCurrent = -1;
+    if (findScope === 'editor' && (mode === 'edit' || mode === 'split')) editorTA.focus();
+  }}
+  // Case-insensitive string replace-all (no regex → no escaping headaches).
+  function replaceAllCI(hay, needle, repl) {{
+    if (!needle) return hay;
+    const low = hay.toLowerCase(), nl = needle.toLowerCase();
+    let out = '', i = 0, idx;
+    while ((idx = low.indexOf(nl, i)) !== -1) {{ out += hay.slice(i, idx) + repl; i = idx + needle.length; }}
+    return out + hay.slice(i);
+  }}
+  function doReplaceOne() {{
+    if (findScope !== 'editor' || findCurrent < 0 || findMatches.length === 0) return;
+    const q = findInput.value;
+    const start = findMatches[findCurrent];
+    editorTA.focus();
+    editorTA.setSelectionRange(start, start + q.length);
+    document.execCommand('insertText', false, replaceInput.value);
+    syncActiveFromEditor();
+    runFind();
+  }}
+  function doReplaceAll() {{
+    if (findScope !== 'editor') return;
+    const q = findInput.value;
+    if (!q) return;
+    const newVal = replaceAllCI(editorTA.value, q, replaceInput.value);
+    if (newVal === editorTA.value) return;
+    editorTA.focus();
+    editorTA.select();
+    document.execCommand('insertText', false, newVal);
+    syncActiveFromEditor();
+    runFind();
+  }}
+  // Push editor value into the active doc (dirty + promote + live render), reusing
+  // the same bookkeeping as normal typing.
+  function syncActiveFromEditor() {{
+    if (typeof onEditorInput === 'function') onEditorInput();
+  }}
+  findInput.addEventListener('input', runFind);
+  findInput.addEventListener('keydown', (e) => {{
+    if (e.key === 'Enter') {{ e.preventDefault(); findGo(e.shiftKey ? -1 : 1); }}
+    else if (e.key === 'Escape') {{ e.preventDefault(); closeFind(); }}
+  }});
+  replaceInput.addEventListener('keydown', (e) => {{
+    if (e.key === 'Enter') {{ e.preventDefault(); doReplaceOne(); }}
+    else if (e.key === 'Escape') {{ e.preventDefault(); closeFind(); }}
+  }});
+  findNextBtn.addEventListener('click', () => findGo(1));
+  findPrevBtn.addEventListener('click', () => findGo(-1));
+  findCloseBtn.addEventListener('click', closeFind);
+  findToggleReplace.addEventListener('click', () => {{
+    if (findScope !== 'editor') return;
+    findReplaceRow.hidden = !findReplaceRow.hidden;
+    if (!findReplaceRow.hidden) replaceInput.focus();
+  }});
+  replaceOneBtn.addEventListener('click', doReplaceOne);
+  replaceAllBtn.addEventListener('click', doReplaceAll);
+
   function setMode(m) {{
+    closeFind();
     if (m !== 'view' && m !== 'edit' && m !== 'split') return;
     mode = m;
     contentArea.classList.remove('mode-view', 'mode-edit', 'mode-split');
@@ -4742,11 +5107,131 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }}
   }}
   editorTA.addEventListener('input', onEditorInput);
+  // Renumber ordered-list items so each indent level runs sequentially, keeping
+  // the first item's starting number. Same-level items increment; a shallower
+  // level clears deeper counters; a non-list paragraph resets everything.
+  function renumberOrderedLists(text) {{
+    const lines = text.split('\n');
+    let counters = {{}};
+    for (let i = 0; i < lines.length; i++) {{
+      const line = lines[i];
+      const om = line.match(/^(\s*)(\d+)([.)])(\s.*)$/);
+      if (om) {{
+        const indent = om[1].length;
+        const kept = {{}};
+        Object.keys(counters).forEach(k => {{ if (parseInt(k, 10) <= indent) kept[k] = counters[k]; }});
+        counters = kept;
+        if (counters[indent] === undefined) counters[indent] = 1;
+        else counters[indent] += 1;
+        lines[i] = om[1] + counters[indent] + om[3] + om[4];
+        continue;
+      }}
+      const um = line.match(/^(\s*)([-*+])(\s.*)$/);
+      if (um) {{
+        const indent = um[1].length;
+        const kept = {{}};
+        Object.keys(counters).forEach(k => {{ if (parseInt(k, 10) < indent) kept[k] = counters[k]; }});
+        counters = kept;
+        continue;
+      }}
+      if (line.trim() !== '') counters = {{}};
+    }}
+    return lines.join('\n');
+  }}
+
+  // Type a wrap char while text is selected → surround the selection with the
+  // matching pair (e.g. select "x" + `*` → `*x*`). Inner text stays selected so
+  // a second press composes (`**x**`, `~~x~~`).
+  const WRAP_PAIRS = {{ '*': '*', '_': '_', '`': '`', '~': '~', '[': ']', '(': ')' }};
   editorTA.addEventListener('keydown', (e) => {{
+    if (!e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing
+        && Object.prototype.hasOwnProperty.call(WRAP_PAIRS, e.key)) {{
+      const s = editorTA.selectionStart, en = editorTA.selectionEnd;
+      if (s !== en) {{
+        e.preventDefault();
+        const sel = editorTA.value.slice(s, en);
+        const open = e.key, close = WRAP_PAIRS[e.key];
+        editorTA.focus();
+        document.execCommand('insertText', false, open + sel + close);
+        editorTA.selectionStart = s + open.length;
+        editorTA.selectionEnd = s + open.length + sel.length;
+        return;
+      }}
+    }}
     if (e.key === 'Tab') {{
       e.preventDefault();
       editorTA.focus();
-      document.execCommand('insertText', false, '  ');
+      const val = editorTA.value;
+      const s = editorTA.selectionStart, en = editorTA.selectionEnd;
+      const curStart = val.lastIndexOf('\n', s - 1) + 1;
+      const curEndNl = val.indexOf('\n', s);
+      const curLine = val.slice(curStart, curEndNl === -1 ? val.length : curEndNl);
+      const onList = /^(\s*)([-*+]|\d+[.)])\s/.test(curLine);
+      // Plain caret not on a list line: keep the old behavior (insert 2 spaces).
+      if (!onList && s === en) {{
+        document.execCommand('insertText', false, '  ');
+        return;
+      }}
+      // Indent/outdent every line the selection touches, then renumber.
+      const firstIdx = (val.slice(0, s).match(/\n/g) || []).length;
+      const lastIdx = (val.slice(0, en).match(/\n/g) || []).length;
+      const lines = val.split('\n');
+      for (let i = firstIdx; i <= lastIdx; i++) {{
+        if (e.shiftKey) {{
+          if (lines[i].startsWith('  ')) lines[i] = lines[i].slice(2);
+          else if (lines[i].startsWith(' ')) lines[i] = lines[i].slice(1);
+        }} else {{
+          lines[i] = '  ' + lines[i];
+        }}
+      }}
+      const newVal = renumberOrderedLists(lines.join('\n'));
+      editorTA.select();
+      document.execCommand('insertText', false, newVal);
+      syncActiveFromEditor();
+      // Reselect the same line range (line indices are stable across the edit).
+      const nl = newVal.split('\n');
+      let so = 0;
+      for (let i = 0; i < firstIdx; i++) so += nl[i].length + 1;
+      let eo = so;
+      for (let i = firstIdx; i < lastIdx; i++) eo += nl[i].length + 1;
+      eo += nl[lastIdx].length;
+      editorTA.setSelectionRange(so, eo);
+      return;
+    }}
+    // Smart list/quote continuation on Enter: pressing Enter inside a list item
+    // (or blockquote) auto-inserts the next marker; an empty item exits instead.
+    if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {{
+      // Let the slash-file popup handle Enter, and never interfere with IME
+      // composition (pressing Enter to confirm a candidate word).
+      if (slashActive || e.isComposing || e.keyCode === 229) return;
+      // Only for a plain caret (no selection).
+      if (editorTA.selectionStart !== editorTA.selectionEnd) return;
+      const val = editorTA.value;
+      const pos = editorTA.selectionStart;
+      const lineStart = val.lastIndexOf('\n', pos - 1) + 1;
+      const line = val.slice(lineStart, pos);
+      let m, indent, marker, content;
+      if ((m = line.match(/^(\s*)([-*+])\s+\[[ xX]\]\s+(.*)$/))) {{
+        indent = m[1]; marker = m[2] + ' [ ] '; content = m[3];
+      }} else if ((m = line.match(/^(\s*)([-*+])\s+(.*)$/))) {{
+        indent = m[1]; marker = m[2] + ' '; content = m[3];
+      }} else if ((m = line.match(/^(\s*)(\d+)([.)])\s+(.*)$/))) {{
+        indent = m[1]; marker = (parseInt(m[2], 10) + 1) + m[3] + ' '; content = m[4];
+      }} else if ((m = line.match(/^(\s*)(>+)\s?(.*)$/))) {{
+        indent = m[1]; marker = m[2] + ' '; content = m[3];
+      }} else {{
+        return; // not a list/quote line — default Enter
+      }}
+      e.preventDefault();
+      editorTA.focus();
+      if (content.trim() === '') {{
+        // Empty item: drop the marker (exit the list) rather than continuing it.
+        editorTA.selectionStart = lineStart;
+        editorTA.selectionEnd = pos;
+        document.execCommand('insertText', false, '');
+      }} else {{
+        document.execCommand('insertText', false, '\n' + indent + marker);
+      }}
       return;
     }}
   }});
@@ -4755,6 +5240,16 @@ summary {{ cursor: pointer; font-weight: 600; }}
   const pendingPastes = [];
   editorTA.addEventListener('paste', (e) => {{
     if (!e.clipboardData) return;
+    // Paste a URL over a selection → wrap it as a markdown link [selection](url).
+    const pasteText = (e.clipboardData.getData('text/plain') || '').trim();
+    const selS = editorTA.selectionStart, selE = editorTA.selectionEnd;
+    if (selS !== selE && /^https?:\/\/\S+$/i.test(pasteText)) {{
+      e.preventDefault();
+      const sel = editorTA.value.slice(selS, selE);
+      editorTA.focus();
+      document.execCommand('insertText', false, '[' + sel + '](' + pasteText + ')');
+      return;
+    }}
     const items = e.clipboardData.items || [];
     for (let i = 0; i < items.length; i++) {{
       const it = items[i];
@@ -5315,6 +5810,66 @@ summary {{ cursor: pointer; font-weight: 600; }}
     try {{ window.ipc.postMessage('open-path-preview:' + encB64(localPath)); }} catch (_) {{}}
   }});
 
+  // Clicking a task-list checkbox in the rendered view toggles [ ]/[x] in the
+  // markdown source at that checkbox's line, marks the doc dirty, and re-renders.
+  previewContainer.addEventListener('change', (e) => {{
+    const cb = e.target;
+    if (!cb || !cb.classList || !cb.classList.contains('task-check')) return;
+    if (activeId === null) return;
+    const doc = docs.get(activeId);
+    if (!doc) return;
+    const line = parseInt(cb.getAttribute('data-task-line'), 10);
+    const lines = doc.markdown.split('\n');
+    if (!Number.isFinite(line) || line < 0 || line >= lines.length) return;
+    const mark = cb.checked ? 'x' : ' ';
+    const newLine = lines[line].replace(/^(\s*[-*+]\s+\[)[ xX](\])/, '$1' + mark + '$2');
+    if (newLine === lines[line]) return; // no task marker on that line — bail
+    lines[line] = newLine;
+    doc.markdown = lines.join('\n');
+    if (editorTA.value !== doc.markdown) editorTA.value = doc.markdown;
+    // A checkbox toggle is an edit: promote a preview tab and flag dirty.
+    if (doc.isPreview) {{
+      doc.isPreview = false;
+      if (previewId === activeId) previewId = null;
+      if (sidebarPane === 'files') renderFileTree();
+    }}
+    doc.dirty = (doc.markdown !== (doc.savedMarkdown || ''));
+    renderTabBar();
+    // Re-render from the new source (also syncs the host's copy of markdown).
+    try {{ window.ipc.postMessage('render:' + activeId + ':' + encB64(doc.markdown)); }} catch (_) {{}}
+  }});
+
+  // ===== Image lightbox =====
+  const imgLightbox = document.getElementById('imgLightbox');
+  const imgLightboxImg = document.getElementById('imgLightboxImg');
+  function closeLightbox() {{
+    imgLightbox.classList.remove('show');
+    imgLightboxImg.removeAttribute('src');
+  }}
+  previewContainer.addEventListener('click', (e) => {{
+    const t = e.target;
+    if (t && t.tagName === 'IMG' && (!t.closest || !t.closest('a'))) {{
+      imgLightboxImg.src = t.src;
+      imgLightbox.classList.add('show');
+    }}
+  }});
+  imgLightbox.addEventListener('click', closeLightbox);
+
+  // ===== Dropped image file -> save into images/ and insert at cursor =====
+  function onImageDrop(pathB64) {{
+    if (activeId === null) return;
+    const doc = docs.get(activeId);
+    if (!doc) return;
+    if (!doc.baseDir) {{ try {{ window.ipc.postMessage('image-needs-save'); }} catch(_) {{}} return; }}
+    if (mode === 'view') setMode('split');
+    editorTA.focus();
+    const tag = 'drop-' + Date.now() + '-' + Math.floor(Math.random() * 100000);
+    const placeholder = '![上传中...](' + tag + ')';
+    pendingPastes.push(tag);
+    document.execCommand('insertText', false, placeholder);
+    try {{ window.ipc.postMessage('drop-image:' + activeId + ':' + pathB64); }} catch(_) {{}}
+  }}
+
   editorTA.addEventListener('click', syncPreviewFromCursor);
   editorTA.addEventListener('keyup', (e) => {{
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight'
@@ -5353,6 +5908,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     externalReload: externalReload,
     applyFileTree: applyFileTree,
     pasteImageInserted: pasteImageInserted,
+    onImageDrop: onImageDrop,
     markSaved: markSaved,
     markSavedAs: markSavedAs,
     saveFailed: saveFailed,
@@ -5370,6 +5926,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
   document.addEventListener('keydown', (e) => {{
     // Block F5 reload
     if (e.key === 'F5') {{ e.preventDefault(); e.stopPropagation(); return; }}
+    // Esc closes the image lightbox.
+    if (e.key === 'Escape' && imgLightbox.classList.contains('show')) {{ e.preventDefault(); closeLightbox(); return; }}
     if (!(e.ctrlKey || e.metaKey)) return;
     const k = (e.key || '').toLowerCase();
     const shift = e.shiftKey;
@@ -5380,6 +5938,10 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (!shift && !alt && k === 'n') {{ stop(); createNewDoc(); return; }}
     if (!shift && !alt && k === 's') {{ stop(); saveActive(); return; }}
     if (!shift && !alt && k === 'o') {{ stop(); try {{ window.ipc.postMessage('open-dialog'); }} catch(_) {{}} return; }}
+
+    // Find / replace
+    if (!shift && !alt && k === 'f') {{ stop(); openFind(false); return; }}
+    if (!shift && !alt && k === 'h') {{ stop(); openFind(true); return; }}
 
     // Undo / Redo
     if (!shift && !alt && k === 'z') {{ stop(); doUndo(); return; }}
