@@ -5,7 +5,9 @@ use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagE
 use std::cell::RefCell;
 use std::env;
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -16,7 +18,12 @@ use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{Event as WinEvent, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
-use wry::WebViewBuilder;
+use std::sync::{Arc, Mutex};
+use wry::{PageLoadEvent, WebViewBuilder};
+
+/// GitHub repo the auto-updater queries for the latest release.
+const GITHUB_OWNER: &str = "jimhy";
+const GITHUB_REPO: &str = "md-viewer";
 
 #[derive(Debug, Clone)]
 enum UserEvent {
@@ -24,6 +31,14 @@ enum UserEvent {
     /// Tick from the file-watch thread asking the main loop to compare each
     /// open doc's on-disk mtime against the cached one.
     CheckFiles,
+    /// A newer release was found on GitHub: (version, release notes, installer URL).
+    UpdateAvailable {
+        version: String,
+        notes: String,
+        url: String,
+    },
+    /// The update download failed after the user asked to install it.
+    UpdateFailed,
 }
 
 struct Doc {
@@ -40,6 +55,14 @@ struct Doc {
     /// pathway uses this to decide whether to warn before overwriting an
     /// externally-modified file.
     acknowledged_mtime: Option<SystemTime>,
+}
+
+impl Doc {
+    /// A doc with no on-disk path is an unsaved "未命名N" buffer. Save flows
+    /// route these through a Save-As dialog instead of writing to `path`.
+    fn is_untitled(&self) -> bool {
+        self.path.as_os_str().is_empty()
+    }
 }
 
 fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
@@ -63,6 +86,11 @@ fn file_url_to_path(uri: &str) -> Option<PathBuf> {
 struct AppState {
     docs: Vec<Doc>,
     next_id: u64,
+    /// Installer URL for a pending update, captured on the Rust side straight
+    /// from the GitHub API response. The `do-update` IPC uses THIS (never a URL
+    /// supplied by the webview) so untrusted markdown can't point the updater at
+    /// an arbitrary executable. Taken (consumed) when an update is launched.
+    pending_update_url: Option<String>,
 }
 
 fn canonical_or_keep(path: &PathBuf) -> PathBuf {
@@ -80,6 +108,7 @@ impl AppState {
         Self {
             docs: Vec::new(),
             next_id: 1,
+            pending_update_url: None,
         }
     }
 
@@ -155,6 +184,73 @@ impl AppState {
         self.docs.retain(|d| d.id != id);
     }
 
+    /// Create a fresh unsaved buffer named "未命名N", where N is the smallest
+    /// positive integer not currently in use by another open untitled buffer.
+    /// The doc has no path/base_dir until the user saves it (Save As).
+    fn new_untitled(&mut self) -> u64 {
+        let mut n = 1u64;
+        loop {
+            let candidate = format!("未命名{}", n);
+            let taken = self
+                .docs
+                .iter()
+                .any(|d| d.is_untitled() && d.name == candidate);
+            if !taken {
+                break;
+            }
+            n += 1;
+        }
+        let name = format!("未命名{}", n);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.docs.push(Doc {
+            id,
+            path: PathBuf::new(),
+            name,
+            base_dir: String::new(),
+            markdown: String::new(),
+            mtime: None,
+            acknowledged_mtime: None,
+        });
+        id
+    }
+
+    /// Write `markdown` to `path` and re-home the doc there: adopts the new
+    /// path/name/base_dir and refreshes the mtime baseline. Used by the Save-As
+    /// flow for untitled buffers. Returns the new (name, base_dir) on success.
+    fn save_as(&mut self, id: u64, path: &PathBuf, markdown: &str) -> Option<(String, String)> {
+        fs::write(path, markdown).ok()?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Untitled.md".to_string());
+        let base_dir = path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let normalized = canonical_or_keep(path);
+        let mtime = file_mtime(&normalized);
+        let d = self.docs.iter_mut().find(|d| d.id == id)?;
+        d.path = normalized;
+        d.name = name.clone();
+        d.base_dir = base_dir.clone();
+        d.markdown = markdown.to_string();
+        d.mtime = mtime;
+        d.acknowledged_mtime = mtime;
+        Some((name, base_dir))
+    }
+
+    /// Is `path` already open in some doc *other* than `id`? Save-As uses this
+    /// to refuse re-homing an untitled buffer onto a file another tab already
+    /// holds, which would otherwise leave two tabs desynced on the same file
+    /// (opening a file normally is deduped by `add_from_path`; Save-As is not).
+    fn is_path_open_elsewhere(&self, id: u64, path: &PathBuf) -> bool {
+        let target = canonical_or_keep(path);
+        self.docs
+            .iter()
+            .any(|d| d.id != id && !d.is_untitled() && canonical_or_keep(&d.path) == target)
+    }
+
     /// Refresh the cached mtime for `id` from disk. Call after a self-write so
     /// the file-watcher doesn't mistake our own save for an external edit, and
     /// so the next save passes the conflict check.
@@ -193,25 +289,26 @@ fn main() {
         return;
     }
 
-    let mut state = AppState::new();
-    let initial_id = if let Some(ref path) = initial_path {
-        match state.add_from_path(path) {
-            Some(r) => Some(r.id),
-            None => {
-                show_error(&format!("Failed to read file: {}", path.display()));
-                return;
-            }
+    // Validate the file upfront so a missing/unreadable path produces an error
+    // dialog before we open any window. The actual content load is deferred to
+    // after the WebView's first page-load (see `with_on_page_load_handler`):
+    // inlining a doc with huge embedded images into the initial HTML would
+    // blow past NavigateToString's ~2MB limit and crash wry's builder.
+    if let Some(ref path) = initial_path {
+        if let Err(e) = fs::metadata(path) {
+            show_error(&format!("Failed to read file: {}\n{}", path.display(), e));
+            return;
         }
-    } else {
-        None
-    };
+    }
 
-    let initial_title = match initial_id.and_then(|id| state.find(id)) {
-        Some(d) => d.name.clone(),
-        None => "MD Viewer".to_string(),
-    };
+    let state = AppState::new();
 
-    let initial_html = render_shell_page(&state, initial_id);
+    let initial_title = initial_path
+        .as_ref()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "MD Viewer".to_string());
+
+    let initial_html = render_shell_page(&state, None);
 
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::<UserEvent>::with_user_event().build();
     {
@@ -226,6 +323,17 @@ fn main() {
             thread::sleep(Duration::from_millis(1500));
             if proxy.send_event(UserEvent::CheckFiles).is_err() {
                 break;
+            }
+        });
+    }
+    {
+        // One-shot: shortly after launch, ask GitHub whether a newer release
+        // exists. Silent on any failure; surfaces a banner only when newer.
+        let proxy = event_loop.create_proxy();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(4));
+            if let Some((version, notes, url)) = check_for_update() {
+                let _ = proxy.send_event(UserEvent::UpdateAvailable { version, notes, url });
             }
         });
     }
@@ -271,13 +379,18 @@ fn main() {
         SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027);
     }
 
-    let html_content = if initial_html.len() > 1_800_000 {
-        strip_large_data_uris(&initial_html)
-    } else {
-        initial_html
-    };
+    // Shell page no longer contains any doc payload, so it's always small.
+    let html_content = initial_html;
 
     let state = Rc::new(RefCell::new(state));
+    // Pending initial path: fired once after the WebView's first page-load
+    // finishes, so the doc data goes through the same evaluate_script path
+    // as drag-drop / pipe-forwarded opens.
+    let pending_initial: Arc<Mutex<Option<PathBuf>>> =
+        Arc::new(Mutex::new(initial_path.clone()));
+    let pending_initial_for_load = pending_initial.clone();
+    let proxy_for_load = event_loop.create_proxy();
+    let proxy_for_ipc = event_loop.create_proxy();
     let webview: Rc<RefCell<Option<wry::WebView>>> = Rc::new(RefCell::new(None));
     let webview_for_ipc = webview.clone();
     let state_for_ipc = state.clone();
@@ -290,7 +403,7 @@ fn main() {
         .with_html(&html_content)
         .with_ipc_handler(move |msg| {
             let body = msg.body().to_string();
-            handle_ipc(&body, hwnd, &state_for_ipc, &webview_for_ipc);
+            handle_ipc(&body, hwnd, &state_for_ipc, &webview_for_ipc, &proxy_for_ipc);
         })
         .with_navigation_handler(move |uri| {
             if uri.starts_with("http://") || uri.starts_with("https://") {
@@ -311,6 +424,23 @@ fn main() {
                 return false;
             }
             true
+        })
+        .with_on_page_load_handler(move |event, _url| {
+            // One-shot: the first time the shell page finishes loading, hand
+            // the initial path (from the command line) off to the event loop
+            // so it gets opened via the same evaluate_script path used by
+            // drag-drop. Doing it here — instead of inlining the doc into
+            // the shell HTML — avoids NavigateToString's 2MB content limit.
+            if !matches!(event, PageLoadEvent::Finished) {
+                return;
+            }
+            let path_opt = match pending_initial_for_load.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(_) => return,
+            };
+            if let Some(path) = path_opt {
+                let _ = proxy_for_load.send_event(UserEvent::OpenFile(path));
+            }
         })
         .with_drag_drop_handler(move |event| {
             if let wry::DragDropEvent::Drop { paths, .. } = event {
@@ -413,6 +543,23 @@ fn main() {
                     }
                 }
             }
+            WinEvent::UserEvent(UserEvent::UpdateAvailable { version, notes, url }) => {
+                // Stash the installer URL on the Rust side; the webview only ever
+                // asks to "start the update", never names what to download.
+                state_for_loop.borrow_mut().pending_update_url = Some(url);
+                if let Some(wv) = webview_for_loop.borrow().as_ref() {
+                    let _ = wv.evaluate_script(&format!(
+                        "window.mdv && mdv.showUpdate('{}', '{}');",
+                        base64_encode(version.as_bytes()),
+                        base64_encode(notes.as_bytes()),
+                    ));
+                }
+            }
+            WinEvent::UserEvent(UserEvent::UpdateFailed) => {
+                if let Some(wv) = webview_for_loop.borrow().as_ref() {
+                    let _ = wv.evaluate_script("window.mdv && mdv.updateFailed();");
+                }
+            }
             WinEvent::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
@@ -434,6 +581,7 @@ fn handle_ipc(
     hwnd: isize,
     state: &Rc<RefCell<AppState>>,
     webview: &Rc<RefCell<Option<wry::WebView>>>,
+    proxy: &EventLoopProxy<UserEvent>,
 ) {
     unsafe {
         #[link(name = "user32")]
@@ -536,19 +684,49 @@ fn handle_ipc(
                     if let Ok(markdown) = String::from_utf8(md_bytes) {
                         let info = {
                             let s = state.borrow();
-                            s.find(id).map(|d| (d.name.clone(), d.path.clone()))
+                            s.find(id).map(|d| (d.name.clone(), d.path.clone(), d.is_untitled()))
                         };
-                        if let Some((name, path)) = info {
+                        if let Some((name, path, untitled)) = info {
                             let text = format!("「{}」 有未保存的修改。\n\n是否保存？", name);
                             let answer = ask_save_dialog(hwnd, &text, "MD Viewer");
                             match answer {
                                 6 => {
-                                    // IDYES: save then close
-                                    if fs::write(&path, &markdown).is_ok() {
-                                        let mut s = state.borrow_mut();
-                                        s.update_markdown(id, markdown);
-                                        s.refresh_mtime(id);
-                                        drop(s);
+                                    // IDYES: save then close. Untitled buffers go
+                                    // through a Save-As dialog first; cancelling
+                                    // it aborts the close (tab stays open).
+                                    let saved_ok = if untitled {
+                                        let default_name = format!("{}.md", name);
+                                        match show_save_dialog(hwnd, &default_name) {
+                                            Some(target) => {
+                                                if state
+                                                    .borrow()
+                                                    .is_path_open_elsewhere(id, &target)
+                                                {
+                                                    show_error(&path_already_open_msg(&target));
+                                                    // Keep the tab so the user can
+                                                    // pick another name.
+                                                    return;
+                                                }
+                                                state
+                                                    .borrow_mut()
+                                                    .save_as(id, &target, &markdown)
+                                                    .is_some()
+                                            }
+                                            None => {
+                                                // Save-As cancelled: keep the tab.
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        let ok = fs::write(&path, &markdown).is_ok();
+                                        if ok {
+                                            let mut s = state.borrow_mut();
+                                            s.update_markdown(id, markdown);
+                                            s.refresh_mtime(id);
+                                        }
+                                        ok
+                                    };
+                                    if saved_ok {
                                         if let Some(wv) = webview.borrow().as_ref() {
                                             let _ = wv.evaluate_script(&format!(
                                                 "window.mdv && mdv.confirmCloseTab({});",
@@ -607,27 +785,83 @@ fn handle_ipc(
         let answer = ask_save_dialog(hwnd, &summary, "MD Viewer");
         match answer {
             6 => {
-                // Save all
-                let mut all_ok = true;
+                // Save all. Untitled buffers each pop a Save-As dialog;
+                // cancelling one aborts the whole close so nothing is lost.
                 let mut failed_id: Option<u64> = None;
+                let mut aborted = false;
+                // UI updates for untitled docs that got a real path, applied
+                // only if we end up NOT terminating (so their tabs re-title).
+                let mut ui_updates: Vec<String> = Vec::new();
                 for (id, md) in &entries {
-                    let path = state.borrow().find(*id).map(|d| d.path.clone());
-                    if let Some(p) = path {
-                        if fs::write(&p, md).is_ok() {
+                    let meta = state
+                        .borrow()
+                        .find(*id)
+                        .map(|d| (d.path.clone(), d.name.clone(), d.is_untitled()));
+                    let (path, name, untitled) = match meta {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    if untitled {
+                        let default_name = format!("{}.md", name);
+                        match show_save_dialog(hwnd, &default_name) {
+                            Some(target)
+                                if state.borrow().is_path_open_elsewhere(*id, &target) =>
+                            {
+                                show_error(&path_already_open_msg(&target));
+                                aborted = true;
+                                break;
+                            }
+                            Some(target) => {
+                                let saved = state.borrow_mut().save_as(*id, &target, md);
+                                match saved {
+                                    Some((new_name, new_base)) => {
+                                        let html_body =
+                                            render_markdown_body(md, &new_base);
+                                        ui_updates.push(format!(
+                                            "window.mdv && mdv.markSavedAs({}, '{}', '{}', '{}');",
+                                            id,
+                                            base64_encode(new_name.as_bytes()),
+                                            base64_encode(new_base.as_bytes()),
+                                            base64_encode(html_body.as_bytes()),
+                                        ));
+                                    }
+                                    None => {
+                                        failed_id = Some(*id);
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {
+                                aborted = true;
+                                break;
+                            }
+                        }
+                    } else if fs::write(&path, md).is_ok() {
+                        {
                             let mut s = state.borrow_mut();
                             s.update_markdown(*id, md.clone());
                             s.refresh_mtime(*id);
-                        } else {
-                            all_ok = false;
-                            failed_id = Some(*id);
-                            break;
                         }
+                        // Clear this tab's dirty marker too — otherwise if the
+                        // close is later aborted (a subsequent untitled doc's
+                        // Save-As is cancelled) it would keep showing "* " and
+                        // re-prompt on the next close.
+                        ui_updates.push(format!("window.mdv && mdv.markSaved({});", id));
+                    } else {
+                        failed_id = Some(*id);
+                        break;
                     }
                 }
-                if all_ok {
+                if !aborted && failed_id.is_none() {
                     terminate_self(hwnd);
-                } else if let Some(fid) = failed_id {
-                    if let Some(wv) = webview.borrow().as_ref() {
+                }
+                // Not terminating: re-title any docs we already saved and, on a
+                // write failure, flag the offending doc.
+                if let Some(wv) = webview.borrow().as_ref() {
+                    for script in &ui_updates {
+                        let _ = wv.evaluate_script(script);
+                    }
+                    if let Some(fid) = failed_id {
                         let _ = wv.evaluate_script(&format!(
                             "window.mdv && mdv.saveFailed({});",
                             fid
@@ -784,6 +1018,54 @@ fn handle_ipc(
         return;
     }
 
+    if body == "new-doc" {
+        let (id, name) = {
+            let mut s = state.borrow_mut();
+            let id = s.new_untitled();
+            let name = s.find(id).map(|d| d.name.clone()).unwrap_or_default();
+            (id, name)
+        };
+        let script = format!(
+            "window.mdv && mdv.addUntitled({}, '{}');",
+            id,
+            base64_encode(name.as_bytes())
+        );
+        if let Some(wv) = webview.borrow().as_ref() {
+            let _ = wv.evaluate_script(&script);
+        }
+        return;
+    }
+
+    if body == "image-needs-save" {
+        show_error(
+            "请先保存文档，然后再粘贴图片。\n\n图片会保存到文档所在目录的 images 子文件夹。",
+        );
+        return;
+    }
+
+    if body == "update-needs-save" {
+        show_error("更新前请先保存所有未保存的文档。");
+        return;
+    }
+
+    if body == "do-update" {
+        // Use ONLY the URL the Rust side captured from GitHub — never a value
+        // from the webview — so untrusted markdown can't point the updater at an
+        // arbitrary executable. Kept (not consumed) so a failed download can be
+        // retried; the worst a replayed message can do is re-fetch the genuine
+        // GitHub installer.
+        let url = state.borrow().pending_update_url.clone();
+        if let Some(url) = url {
+            if is_trusted_update_url(&url) {
+                // Download + install off the UI thread so the app stays
+                // responsive; run_update terminates us once the installer runs.
+                let proxy = proxy.clone();
+                thread::spawn(move || run_update(url, hwnd, proxy));
+            }
+        }
+        return;
+    }
+
     if body == "open-dialog" {
         let paths = show_open_dialog(hwnd);
         for path in paths {
@@ -862,9 +1144,49 @@ fn handle_ipc(
                     if let Ok(markdown) = String::from_utf8(md_bytes) {
                         let info = {
                             let s = state.borrow();
-                            s.find(id).map(|d| (d.path.clone(), d.name.clone(), d.acknowledged_mtime))
+                            s.find(id).map(|d| {
+                                (d.path.clone(), d.name.clone(), d.acknowledged_mtime, d.is_untitled())
+                            })
                         };
-                        if let Some((path, name, ack_mtime)) = info {
+                        if let Some((path, name, ack_mtime, untitled)) = info {
+                            // Untitled buffer: no on-disk path yet, so route
+                            // Ctrl+S through a Save-As dialog. On success the
+                            // doc adopts the chosen path/name/base_dir.
+                            if untitled {
+                                let default_name = format!("{}.md", name);
+                                let script = match show_save_dialog(hwnd, &default_name) {
+                                    Some(target)
+                                        if state.borrow().is_path_open_elsewhere(id, &target) =>
+                                    {
+                                        show_error(&path_already_open_msg(&target));
+                                        format!("window.mdv && mdv.saveCancelled({});", id)
+                                    }
+                                    Some(target) => {
+                                        let saved = state.borrow_mut().save_as(id, &target, &markdown);
+                                        match saved {
+                                            Some((new_name, new_base)) => {
+                                                let html_body =
+                                                    render_markdown_body(&markdown, &new_base);
+                                                format!(
+                                                    "window.mdv && mdv.markSavedAs({}, '{}', '{}', '{}');",
+                                                    id,
+                                                    base64_encode(new_name.as_bytes()),
+                                                    base64_encode(new_base.as_bytes()),
+                                                    base64_encode(html_body.as_bytes()),
+                                                )
+                                            }
+                                            None => {
+                                                format!("window.mdv && mdv.saveFailed({});", id)
+                                            }
+                                        }
+                                    }
+                                    None => format!("window.mdv && mdv.saveCancelled({});", id),
+                                };
+                                if let Some(wv) = webview.borrow().as_ref() {
+                                    let _ = wv.evaluate_script(&script);
+                                }
+                                return;
+                            }
                             // Conflict check: if the file on disk is newer than
                             // what the user has acknowledged, ask before
                             // clobbering it.
@@ -1206,6 +1528,84 @@ fn show_open_dialog(owner_hwnd: isize) -> Vec<PathBuf> {
     segments[1..].iter().map(|n| dir.join(n)).collect()
 }
 
+/// Show a native "Save As" dialog, pre-filled with `default_name`, and return
+/// the chosen path (None if the user cancelled). Used to give untitled buffers
+/// a real file. OFN_OVERWRITEPROMPT makes Windows confirm before clobbering an
+/// existing file, and the `md` default extension is appended when the user
+/// types a bare name.
+fn show_save_dialog(owner_hwnd: isize, default_name: &str) -> Option<PathBuf> {
+    let mut buffer: Vec<u16> = vec![0u16; 32_768];
+    // Pre-fill the file-name field with the suggested name.
+    for (i, u) in default_name.encode_utf16().enumerate() {
+        if i + 1 >= buffer.len() {
+            break;
+        }
+        buffer[i] = u;
+    }
+
+    let mut filter: Vec<u16> = Vec::new();
+    for part in [
+        "Markdown Files (*.md;*.markdown)",
+        "*.md;*.markdown",
+        "All Files (*.*)",
+        "*.*",
+    ] {
+        filter.extend(part.encode_utf16());
+        filter.push(0);
+    }
+    filter.push(0);
+
+    let title: Vec<u16> = "保存 Markdown 文件"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let def_ext: Vec<u16> = "md".encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut ofn = Ofnw {
+        l_struct_size: std::mem::size_of::<Ofnw>() as u32,
+        hwnd_owner: owner_hwnd,
+        h_instance: 0,
+        lp_str_filter: filter.as_ptr(),
+        lp_str_custom_filter: std::ptr::null_mut(),
+        n_max_cust_filter: 0,
+        n_filter_index: 1,
+        lp_str_file: buffer.as_mut_ptr(),
+        n_max_file: buffer.len() as u32,
+        lp_str_file_title: std::ptr::null_mut(),
+        n_max_file_title: 0,
+        lp_str_initial_dir: std::ptr::null(),
+        lp_str_title: title.as_ptr(),
+        // OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+        flags: 0x0008_0000 | 0x0000_0002 | 0x0000_0800 | 0x0000_0008,
+        n_file_offset: 0,
+        n_file_extension: 0,
+        lp_str_def_ext: def_ext.as_ptr(),
+        l_cust_data: 0,
+        lpfn_hook: 0,
+        lp_template_name: std::ptr::null(),
+        pv_reserved: std::ptr::null(),
+        dw_reserved: 0,
+        flags_ex: 0,
+    };
+
+    let ok = unsafe {
+        #[link(name = "comdlg32")]
+        extern "system" {
+            fn GetSaveFileNameW(ofn: *mut Ofnw) -> i32;
+        }
+        GetSaveFileNameW(&mut ofn)
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    if end == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..end])))
+}
+
 fn detect_image_ext(data: &[u8]) -> &'static str {
     if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
         "png"
@@ -1371,6 +1771,197 @@ fn terminate_self(hwnd: isize) -> ! {
     }
     // Unreachable, but the compiler doesn't know.
     std::process::exit(0);
+}
+
+// ===== Auto-update (GitHub Releases) =====
+
+/// Spawn subprocesses without flashing a console window.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Absolute path to the system `curl` (`%SystemRoot%\System32\curl.exe`). Using
+/// the full path avoids the `CreateProcess` search picking up a `curl.exe`
+/// planted in the current directory (e.g. the folder a `.md` was opened from).
+fn curl_path() -> PathBuf {
+    let root = env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    PathBuf::from(root).join("System32").join("curl.exe")
+}
+
+/// Only ever fetch/download from GitHub over HTTPS. Defense in depth: the URL
+/// already originates from the GitHub API, but we re-check the scheme/host
+/// before handing it to curl so nothing else can slip through.
+fn is_trusted_update_url(url: &str) -> bool {
+    let rest = match url.strip_prefix("https://") {
+        Some(r) => r,
+        None => return false,
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host); // ignore any userinfo
+    let host = host.split(':').next().unwrap_or(host); // ignore any port
+    let host = host.to_ascii_lowercase();
+    host == "github.com"
+        || host == "api.github.com"
+        || host.ends_with(".githubusercontent.com")
+}
+
+/// HTTP GET a URL as text via the system `curl` (bundled with Windows 10 1803+),
+/// following redirects. Returns None on any failure — offline, curl missing,
+/// or non-2xx — so the updater never disrupts normal use.
+fn curl_get_text(url: &str) -> Option<String> {
+    if !is_trusted_update_url(url) {
+        return None;
+    }
+    let out = Command::new(curl_path())
+        .args(["-fsSL", "--max-time", "20", "-H", "User-Agent: md-viewer-updater", "--"])
+        .arg(url)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// Download `url` to `dest` via the system `curl`. True only when curl reported
+/// success and the file actually landed. Rejects non-GitHub/non-HTTPS URLs.
+fn curl_download(url: &str, dest: &std::path::Path) -> bool {
+    if !is_trusted_update_url(url) {
+        return false;
+    }
+    let status = Command::new(curl_path())
+        .args(["-fsSL", "--max-time", "300", "-H", "User-Agent: md-viewer-updater", "-o"])
+        .arg(dest)
+        // `--` stops option parsing so a URL starting with `-` can't be treated
+        // as a curl flag (argument injection).
+        .arg("--")
+        .arg(url)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    matches!(status, Ok(s) if s.success()) && dest.is_file()
+}
+
+/// Extract the first JSON string value for `"key": "value"`. Handles the escapes
+/// GitHub emits in the fields we read; not a full parser, but enough for
+/// tag_name / browser_download_url / body. `json` must begin at or before the key.
+fn json_string_field(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let start = json.find(&needle)? + needle.len();
+    let rest = &json[start..];
+    let colon = rest.find(':')?;
+    let after = &rest[colon + 1..];
+    let q = after.find('"')?;
+    let mut chars = after[q + 1..].chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('u') => {
+                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                    if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(cp) {
+                            out.push(ch);
+                        }
+                    }
+                }
+                Some(other) => out.push(other),
+                None => break,
+            },
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// Scan a release JSON's assets for the Windows installer's download URL.
+fn find_installer_url(json: &str) -> Option<String> {
+    let key = "\"browser_download_url\"";
+    let mut idx = 0;
+    while let Some(pos) = json[idx..].find(key) {
+        let abs = idx + pos;
+        if let Some(url) = json_string_field(&json[abs..], "browser_download_url") {
+            let lower = url.to_lowercase();
+            if lower.ends_with(".exe") && lower.contains("setup") {
+                return Some(url);
+            }
+        }
+        idx = abs + key.len();
+    }
+    None
+}
+
+/// Parse a `major.minor.patch` version (tolerating a leading `v` and trailing
+/// suffixes like `-beta`). Missing/garbage segments read as 0.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let t = s.trim().trim_start_matches(['v', 'V']);
+    let mut it = t.split('.').map(|seg| {
+        let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().unwrap_or(0)
+    });
+    let a = it.next()?;
+    let b = it.next().unwrap_or(0);
+    let c = it.next().unwrap_or(0);
+    Some((a, b, c))
+}
+
+fn remote_is_newer(remote: &str, local: &str) -> bool {
+    match (parse_semver(remote), parse_semver(local)) {
+        (Some(r), Some(l)) => r > l,
+        _ => false,
+    }
+}
+
+/// Query GitHub for the latest release; return (version, notes, installer_url)
+/// only when it is strictly newer than the running build. Any failure → None.
+fn check_for_update() -> Option<(String, String, String)> {
+    let api = format!(
+        "https://api.github.com/repos/{}/{}/releases/latest",
+        GITHUB_OWNER, GITHUB_REPO
+    );
+    let json = curl_get_text(&api)?;
+    let tag = json_string_field(&json, "tag_name")?;
+    if !remote_is_newer(&tag, env!("CARGO_PKG_VERSION")) {
+        return None;
+    }
+    let url = find_installer_url(&json)?;
+    let notes = json_string_field(&json, "body").unwrap_or_default();
+    Some((tag, notes, url))
+}
+
+/// Download the installer and hand off to it. On success we launch the setup
+/// (its `CloseApplications=force` closes us) and terminate; on failure we ping
+/// the UI so the banner can offer a retry. Runs on a background thread.
+fn run_update(url: String, hwnd: isize, proxy: EventLoopProxy<UserEvent>) {
+    let ts = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let dest = std::env::temp_dir().join(format!("md-viewer-setup-{}.exe", ts));
+    if curl_download(&url, &dest) && open::that(&dest).is_ok() {
+        // Installer launched — give it a moment to start before we vanish.
+        thread::sleep(Duration::from_millis(800));
+        terminate_self(hwnd);
+    } else {
+        let _ = proxy.send_event(UserEvent::UpdateFailed);
+    }
+}
+
+/// Warning shown when a Save-As target is already open in another tab.
+fn path_already_open_msg(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    format!(
+        "「{}」 已在其他标签页打开。\n\n请切换到该标签页编辑，或另存为其他文件名。",
+        name
+    )
 }
 
 fn show_error(msg: &str) {
@@ -1570,27 +2161,6 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, &'static str> {
         }
     }
     Ok(out)
-}
-
-fn strip_large_data_uris(html: &str) -> String {
-    let mut result = String::with_capacity(html.len() / 2);
-    let mut pos = 0;
-    while pos < html.len() {
-        if let Some(idx) = html[pos..].find("data:image") {
-            let abs = pos + idx;
-            if let Some(end) = html[abs..].find('"').or_else(|| html[abs..].find('\'')) {
-                let uri = &html[abs..abs + end];
-                if uri.len() > 200_000 {
-                    result.push_str(&html[pos..abs]);
-                    pos = abs + end;
-                    continue;
-                }
-            }
-        }
-        result.push_str(&html[pos..]);
-        break;
-    }
-    result
 }
 
 fn embed_local_images(html: &str, base_dir: &str) -> String {
@@ -1933,13 +2503,26 @@ body {{
 .titlebar-ver {{ font-size: 10px; opacity: 0.5; font-weight: 400; }}
 
 /* ===== Tab bar (own row below titlebar) ===== */
-.tab-bar {{
+/* The row is a non-scrolling flex container: the tab list (.tab-bar) can grow
+   up to its content width then shrinks & scrolls, while the "+" button stays
+   pinned to the right — mirroring VS Code's new-tab affordance. */
+.tab-row {{
   flex-shrink: 0;
   height: 34px;
   display: flex;
   align-items: stretch;
   background: var(--titlebar-bg);
   border-bottom: 1px solid var(--titlebar-border);
+  overflow: hidden;
+}}
+.tab-bar {{
+  display: flex;
+  align-items: stretch;
+  /* grow: 0 (don't stretch past content), shrink: 1 (yield to the + button),
+     basis: auto (natural content width) — so + follows the last tab until the
+     tabs overflow, then the list scrolls and + stays visible. */
+  flex: 0 1 auto;
+  min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
@@ -1947,6 +2530,29 @@ body {{
 }}
 .tab-bar::-webkit-scrollbar {{ height: 0; display: none; }}
 .tab-bar.empty {{ display: none; }}
+.new-tab-btn {{
+  flex: 0 0 auto;
+  width: 34px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--fg-secondary);
+  transition: background .12s, color .12s;
+}}
+.new-tab-btn:hover {{ background: var(--btn-hover); color: var(--fg); }}
+.new-tab-btn svg {{
+  width: 13px;
+  height: 13px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}}
 
 /* External-change banner: shown when a dirty tab's file is modified on disk. */
 .reload-banner {{
@@ -1994,6 +2600,43 @@ body {{
   }}
   .reload-banner-btn:hover {{ background: rgba(0,0,0,0.4); }}
 }}
+
+/* Update-available banner (blue accent, distinct from the yellow reload one). */
+.update-banner {{
+  display: none;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 8px 0 8px;
+  padding: 7px 12px;
+  background: var(--accent-light);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 13px;
+  flex-shrink: 0;
+}}
+.update-banner.show {{ display: flex; }}
+.update-banner-icon {{ font-size: 15px; color: var(--accent); font-weight: 700; }}
+.update-banner-msg {{ flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.update-banner-btn {{
+  height: 26px;
+  padding: 0 10px;
+  background: rgba(127,127,127,0.10);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}}
+.update-banner-btn:hover {{ background: rgba(127,127,127,0.18); }}
+.update-banner-btn:disabled {{ opacity: 0.5; cursor: default; }}
+.update-banner-btn.primary {{
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}}
+.update-banner-btn.primary:hover {{ filter: brightness(1.08); }}
+.update-banner-btn.primary:disabled {{ filter: none; }}
 .tab {{
   flex-shrink: 0;
   min-width: 100px;
@@ -2853,13 +3496,25 @@ summary {{ cursor: pointer; font-weight: 600; }}
   </div>
 </div>
 
-<div class="tab-bar empty" id="tabBar"></div>
+<div class="tab-row" id="tabRow">
+  <div class="tab-bar empty" id="tabBar"></div>
+  <button class="new-tab-btn" id="newTabBtn" type="button" title="新建文档 (Ctrl+N)">
+    <svg viewBox="0 0 14 14"><line x1="7" y1="2" x2="7" y2="12"/><line x1="2" y1="7" x2="12" y2="7"/></svg>
+  </button>
+</div>
 
 <div class="reload-banner" id="reloadBanner">
   <span class="reload-banner-icon">⚠</span>
   <span class="reload-banner-msg">该文件已被外部修改</span>
   <button class="reload-banner-btn" id="reloadBannerKeep" type="button">保留我的</button>
   <button class="reload-banner-btn primary" id="reloadBannerLoad" type="button">重载磁盘</button>
+</div>
+
+<div class="update-banner" id="updateBanner">
+  <span class="update-banner-icon">⬆</span>
+  <span class="update-banner-msg" id="updateBannerMsg">发现新版本</span>
+  <button class="update-banner-btn" id="updateBannerLater" type="button">稍后</button>
+  <button class="update-banner-btn primary" id="updateBannerDo" type="button">立即更新</button>
 </div>
 
 <div class="slash-popup" id="slashPopup" hidden></div>
@@ -2987,6 +3642,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
   let renderTimer = null;
 
   const tabBar = document.getElementById('tabBar');
+  const newTabBtn = document.getElementById('newTabBtn');
   const modeGroup = document.getElementById('modeGroup');
   const contentArea = document.getElementById('contentArea');
   const editorTA = document.getElementById('editorTextarea');
@@ -3003,6 +3659,11 @@ summary {{ cursor: pointer; font-weight: 600; }}
   const reloadBanner = document.getElementById('reloadBanner');
   const reloadBannerKeep = document.getElementById('reloadBannerKeep');
   const reloadBannerLoad = document.getElementById('reloadBannerLoad');
+  const updateBanner = document.getElementById('updateBanner');
+  const updateBannerMsg = document.getElementById('updateBannerMsg');
+  const updateBannerLater = document.getElementById('updateBannerLater');
+  const updateBannerDo = document.getElementById('updateBannerDo');
+  let updateAvailable = false;
 
   function decB64(b64) {{
     if (!b64) return '';
@@ -3204,6 +3865,31 @@ summary {{ cursor: pointer; font-weight: 600; }}
     else renderTabBar();
   }}
 
+  // Ask the host to allocate a new "未命名N" buffer. It replies via addUntitled.
+  function createNewDoc() {{
+    try {{ window.ipc.postMessage('new-doc'); }} catch(_) {{}}
+  }}
+
+  // Register a brand-new unsaved buffer (empty content, no on-disk path). It
+  // starts non-dirty so closing an untouched blank tab won't nag; typing marks
+  // it dirty and the close/quit flows then route through Save-As.
+  function addUntitled(id, nameB64) {{
+    const name = decB64(nameB64);
+    if (!docs.has(id)) {{
+      docs.set(id, {{
+        id, name, baseDir: '', markdown: '', htmlBody: '',
+        savedMarkdown: '', dirty: false, isPreview: false, untitled: true,
+      }});
+      docOrder.push(id);
+    }}
+    switchTo(id);
+    // A blank buffer is for writing. View mode has no editor, and pure edit
+    // mode wouldn't live-render the preview — so from view we drop into split
+    // (editor + live preview). An existing edit/split choice is respected.
+    if (mode === 'view') setMode('split');
+    setTimeout(() => editorTA.focus(), 0);
+  }}
+
   function addDocPreview(id, nameB64, baseB64, mdB64, htmlB64) {{
     const name = decB64(nameB64);
     const baseDir = decB64(baseB64);
@@ -3278,6 +3964,38 @@ summary {{ cursor: pointer; font-weight: 600; }}
     delete doc.externalHtml;
     renderTabBar();
     if (activeId === id) updateReloadBanner();
+  }}
+
+  // An untitled buffer was just written to a real file via Save-As. Adopt the
+  // new name/baseDir, clear the untitled flag, and settle the dirty state the
+  // same way markSaved does (honoring any keystrokes that raced the write).
+  function markSavedAs(id, nameB64, baseB64, htmlB64) {{
+    const doc = docs.get(id);
+    if (!doc) return;
+    doc.name = decB64(nameB64);
+    doc.baseDir = decB64(baseB64);
+    doc.htmlBody = decB64(htmlB64);
+    doc.enhancedHtml = null;
+    doc.untitled = false;
+    doc.isPreview = false;
+    if (doc.pendingSaveSnapshot !== undefined) {{
+      doc.savedMarkdown = doc.pendingSaveSnapshot;
+      doc.pendingSaveSnapshot = undefined;
+    }} else {{
+      doc.savedMarkdown = doc.markdown;
+    }}
+    doc.dirty = (doc.markdown !== doc.savedMarkdown);
+    delete doc.externalMd;
+    delete doc.externalHtml;
+    if (activeId === id) {{
+      setBaseHref(doc.baseDir);
+      updateWindowTitle(doc.name);
+      setPreviewHtml(doc.htmlBody, true);
+      doc.enhancedHtml = previewContainer.innerHTML;
+      updateReloadBanner();
+      if (sidebarPane === 'files') requestFileTree();
+    }}
+    renderTabBar();
   }}
 
   function saveFailed(id) {{
@@ -3400,6 +4118,50 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (doc) keepLocalVersion(doc);
   }});
 
+  // ===== Auto-update banner =====
+  // Called from the host when a newer GitHub release is found. The installer URL
+  // lives on the Rust side; the UI only ever asks the host to start the update.
+  let updating = false;
+  function showUpdate(versionB64, notesB64) {{
+    const version = decB64(versionB64);
+    updateAvailable = true;
+    updateBannerMsg.textContent = '发现新版本 v' + version + '，是否更新？';
+    updateBannerMsg.title = decB64(notesB64) || '';
+    updateBannerDo.disabled = false;
+    updateBannerLater.disabled = false;
+    updateBannerDo.textContent = '立即更新';
+    updateBanner.classList.add('show');
+  }}
+  function updateFailed() {{
+    updating = false;
+    editorTA.readOnly = false;
+    updateBannerMsg.textContent = '下载失败，请重试';
+    updateBannerDo.disabled = false;
+    updateBannerLater.disabled = false;
+    updateBannerDo.textContent = '重试';
+  }}
+  function doUpdate() {{
+    if (!updateAvailable || updating) return;
+    // Relaunching the installer closes the app — guard unsaved work first.
+    for (const id of docOrder) {{
+      const d = docs.get(id);
+      if (d && d.dirty) {{
+        try {{ window.ipc.postMessage('update-needs-save'); }} catch(_) {{}}
+        return;
+      }}
+    }}
+    // Lock editing while downloading so nothing typed during the download is
+    // lost when the app exits to run the installer.
+    updating = true;
+    editorTA.readOnly = true;
+    updateBannerMsg.textContent = '正在下载更新…';
+    updateBannerDo.disabled = true;
+    updateBannerLater.disabled = true;
+    try {{ window.ipc.postMessage('do-update'); }} catch(_) {{}}
+  }}
+  updateBannerDo.addEventListener('click', doUpdate);
+  updateBannerLater.addEventListener('click', () => {{ if (!updating) updateBanner.classList.remove('show'); }});
+
   function setMode(m) {{
     if (m !== 'view' && m !== 'edit' && m !== 'split') return;
     mode = m;
@@ -3521,8 +4283,12 @@ summary {{ cursor: pointer; font-weight: 600; }}
     tocList.innerHTML = '';
     // Keep the sidebar visible even when the doc has no headings — the Files
     // pane lives in the same sidebar and must stay reachable. Just leave the
-    // TOC list empty.
+    // TOC list empty. Still re-position the toggle button, otherwise a doc
+    // with no headings (e.g. a brand-new empty doc) leaves tocToggle.left
+    // unset and the button lands in the wrong place.
     if (headings.length === 0) {{
+      tocToggle.style.display = '';
+      syncToggleBtn();
       return;
     }}
     tocSidebar.classList.remove('collapsed');
@@ -3997,6 +4763,14 @@ summary {{ cursor: pointer; font-weight: 600; }}
         if (!file) continue;
         e.preventDefault();
         if (activeId === null) return;
+        const curDoc = docs.get(activeId);
+        // An unsaved (未命名) buffer has no folder to write the image into, so the
+        // host would silently drop it and leave the placeholder stuck. Ask the
+        // user to save first instead of inserting a doomed placeholder.
+        if (!curDoc || !curDoc.baseDir) {{
+          try {{ window.ipc.postMessage('image-needs-save'); }} catch(_) {{}}
+          return;
+        }}
         const tag = 'paste-' + Date.now() + '-' + Math.floor(Math.random() * 100000);
         const placeholder = '![上传中...](' + tag + ')';
         pendingPastes.push(tag);
@@ -4360,6 +5134,25 @@ summary {{ cursor: pointer; font-weight: 600; }}
     b.addEventListener('click', () => setMode(b.dataset.mode));
   }});
 
+  // New-tab (+) button
+  if (newTabBtn) {{
+    newTabBtn.addEventListener('click', createNewDoc);
+  }}
+
+  // Vertical mouse-wheel scrolls the tab strip horizontally (the scrollbar is
+  // hidden, VS Code style), so overflowed tabs on the far left stay reachable.
+  tabBar.addEventListener('wheel', (e) => {{
+    if (tabBar.scrollWidth <= tabBar.clientWidth) return;
+    const raw = e.deltaY !== 0 ? e.deltaY : e.deltaX;
+    if (raw === 0) return;
+    e.preventDefault();
+    // deltaMode: 0=pixel, 1=line, 2=page — normalize to pixels.
+    const step = e.deltaMode === 1 ? raw * 24
+               : e.deltaMode === 2 ? raw * tabBar.clientWidth
+               : raw;
+    tabBar.scrollLeft += step;
+  }}, {{ passive: false }});
+
   // Window controls
   document.getElementById('btnMin').addEventListener('click', () => window.ipc.postMessage('minimize'));
   document.getElementById('btnMax').addEventListener('click', () => window.ipc.postMessage('maximize'));
@@ -4554,12 +5347,14 @@ summary {{ cursor: pointer; font-weight: 600; }}
   window.mdv = {{
     addDoc: addDocFromB64,
     addDocPreview: addDocPreview,
+    addUntitled: addUntitled,
     replaceDoc: replaceDoc,
     applyRender: applyRender,
     externalReload: externalReload,
     applyFileTree: applyFileTree,
     pasteImageInserted: pasteImageInserted,
     markSaved: markSaved,
+    markSavedAs: markSavedAs,
     saveFailed: saveFailed,
     saveCancelled: saveCancelled,
     switchTo: switchTo,
@@ -4567,6 +5362,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
     confirmCloseTab: forceCloseDoc,
     tryCloseWindow: tryCloseWindow,
     setMode: setMode,
+    showUpdate: showUpdate,
+    updateFailed: updateFailed,
   }};
 
   // Global keyboard shortcuts
@@ -4579,7 +5376,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
     const alt = e.altKey;
     const stop = () => {{ e.preventDefault(); e.stopPropagation(); }};
 
-    // Save / Open
+    // New / Save / Open
+    if (!shift && !alt && k === 'n') {{ stop(); createNewDoc(); return; }}
     if (!shift && !alt && k === 's') {{ stop(); saveActive(); return; }}
     if (!shift && !alt && k === 'o') {{ stop(); try {{ window.ipc.postMessage('open-dialog'); }} catch(_) {{}} return; }}
 

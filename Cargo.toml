@@ -1,6 +1,6 @@
 [package]
 name = "md-viewer"
-version = "1.0.15"
+version = "1.0.17"
 edition = "2021"
 description = "A beautiful Markdown viewer for Windows"
 
