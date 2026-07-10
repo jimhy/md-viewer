@@ -4009,6 +4009,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
       setPreviewHtml(doc.htmlBody, false);
       doc.enhancedHtml = previewContainer.innerHTML;
     }}
+    // The cached HTML may predate edits made while the preview was hidden.
+    // Refresh from source when the preview is visible.
+    if (mode !== 'edit') refreshPreviewIfStale();
     if (mode === 'edit') editorTA.focus();
     if (sidebarPane === 'files') {{
       // Permanent switch may need re-scan (different baseDir);
@@ -4251,6 +4254,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (doc) {{
       doc.htmlBody = html;
       doc.enhancedHtml = null;
+      // Preview now reflects the current source again.
+      doc.previewStale = false;
     }}
     if (activeId === id) {{
       setPreviewHtml(html, true);
@@ -4565,6 +4570,16 @@ summary {{ cursor: pointer; font-weight: 600; }}
   replaceOneBtn.addEventListener('click', doReplaceOne);
   replaceAllBtn.addEventListener('click', doReplaceAll);
 
+  // If the active doc was edited while the preview was hidden (pure edit mode),
+  // its preview HTML is stale. Ask the host to re-render from the current
+  // source so the preview matches what's in the editor.
+  function refreshPreviewIfStale() {{
+    if (activeId === null) return;
+    const doc = docs.get(activeId);
+    if (!doc || !doc.previewStale) return;
+    try {{ window.ipc.postMessage('render:' + activeId + ':' + encB64(doc.markdown)); }} catch (_) {{}}
+  }}
+
   function setMode(m) {{
     closeFind();
     if (m !== 'view' && m !== 'edit' && m !== 'split') return;
@@ -4574,6 +4589,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
     document.querySelectorAll('.mode-btn').forEach(b => {{
       b.classList.toggle('active', b.dataset.mode === m);
     }});
+    // Entering a mode that shows the preview: refresh it if it's stale.
+    if (m === 'view' || m === 'split') refreshPreviewIfStale();
     if (m === 'view' && activeId !== null) buildTOC();
     if (m === 'edit') {{ setTimeout(() => editorTA.focus(), 0); }}
     if (m === 'split') highlightCursorBlock();
@@ -5119,6 +5136,10 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (!doc) return;
     if (doc.markdown !== editorTA.value) {{
       doc.markdown = editorTA.value;
+      // Content changed; the visible preview no longer matches the source.
+      // In edit mode we skip live re-render (preview is hidden), so mark it
+      // stale and let setMode/switchTo refresh it when the preview reappears.
+      doc.previewStale = true;
       let needTabRefresh = false;
       // Recompute dirty from the saved baseline so undoing back to the
       // on-disk content clears the modified marker.
