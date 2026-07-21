@@ -3701,8 +3701,8 @@ dd {{
   color: var(--fg-secondary);
 }}
 
-/* Offline Mermaid diagrams. Wide diagrams scroll instead of shrinking until
-   their labels are unreadable, which is important for architecture charts. */
+/* Offline Mermaid diagrams. Oversized diagrams use a draggable viewport instead
+   of shrinking until their labels are unreadable. */
 .mermaid-source {{
   display: none;
 }}
@@ -3710,17 +3710,28 @@ dd {{
   box-sizing: border-box;
   width: 100%;
   max-width: 100%;
+  max-height: min(72vh, 900px);
   margin: 0 0 1.2em 0;
   padding: 1em;
-  overflow-x: auto;
+  overflow: auto;
   overscroll-behavior-x: contain;
-  touch-action: pan-y;
+  overscroll-behavior-y: auto;
+  touch-action: pan-x pan-y;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
   background: var(--block-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
 }}
-.mermaid-diagram.can-pan {{ cursor: grab; }}
+.mermaid-diagram::-webkit-scrollbar {{
+  display: none;
+  width: 0;
+  height: 0;
+}}
+.mermaid-diagram.can-pan {{
+  cursor: grab;
+}}
 .mermaid-diagram.is-panning {{
   cursor: grabbing;
   user-select: none;
@@ -3819,7 +3830,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
   body {{ background: #fff; color: #000; }}
   .container {{ max-width: 100%; padding: 20px; }}
   pre {{ box-shadow: none; border: 1px solid #ddd; }}
-  .mermaid-diagram {{ overflow: visible; box-shadow: none; }}
+  .mermaid-diagram {{ max-height: none; overflow: visible; box-shadow: none; }}
   .mermaid-diagram svg {{ min-width: 0; max-width: 100% !important; }}
 }}
 </style>
@@ -4109,9 +4120,15 @@ summary {{ cursor: pointer; font-weight: 600; }}
   const mermaidPanBound = new WeakSet();
 
   function updateMermaidPanState(holder) {{
-    const canPan = holder.scrollWidth > holder.clientWidth + 1;
+    const canPan = holder.scrollWidth > holder.clientWidth + 1 ||
+      holder.scrollHeight > holder.clientHeight + 1;
     holder.classList.toggle('can-pan', canPan);
     if (!canPan) holder.classList.remove('is-panning');
+  }}
+
+  function centerMermaidViewport(holder) {{
+    holder.scrollLeft = Math.max(0, (holder.scrollWidth - holder.clientWidth) / 2);
+    holder.scrollTop = Math.max(0, (holder.scrollHeight - holder.clientHeight) / 2);
   }}
 
   function bindMermaidPan(holder) {{
@@ -4122,15 +4139,20 @@ summary {{ cursor: pointer; font-weight: 600; }}
     mermaidPanBound.add(holder);
     let pointerId = null;
     let startX = 0;
+    let startY = 0;
     let startScrollLeft = 0;
+    let startScrollTop = 0;
     let moved = false;
 
     holder.addEventListener('pointerdown', (event) => {{
       updateMermaidPanState(holder);
-      if (event.button !== 0 || !holder.classList.contains('can-pan')) return;
+      if (event.button !== 0 || event.pointerType === 'touch' ||
+          !holder.classList.contains('can-pan')) return;
       pointerId = event.pointerId;
       startX = event.clientX;
+      startY = event.clientY;
       startScrollLeft = holder.scrollLeft;
+      startScrollTop = holder.scrollTop;
       moved = false;
       try {{ holder.setPointerCapture(pointerId); }} catch (_) {{}}
       event.preventDefault();
@@ -4138,11 +4160,13 @@ summary {{ cursor: pointer; font-weight: 600; }}
 
     holder.addEventListener('pointermove', (event) => {{
       if (pointerId === null || event.pointerId !== pointerId) return;
-      const distance = event.clientX - startX;
-      if (!moved && Math.abs(distance) < 3) return;
+      const distanceX = event.clientX - startX;
+      const distanceY = event.clientY - startY;
+      if (!moved && Math.max(Math.abs(distanceX), Math.abs(distanceY)) < 3) return;
       moved = true;
       holder.classList.add('is-panning');
-      holder.scrollLeft = startScrollLeft - distance;
+      holder.scrollLeft = startScrollLeft - distanceX;
+      holder.scrollTop = startScrollTop - distanceY;
       event.preventDefault();
     }});
 
@@ -4158,6 +4182,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     holder.addEventListener('lostpointercapture', finishPan);
     holder.addEventListener('dragstart', event => event.preventDefault());
     updateMermaidPanState(holder);
+    centerMermaidViewport(holder);
   }}
 
   function renderMath(root) {{

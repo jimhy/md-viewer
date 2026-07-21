@@ -12,7 +12,7 @@ A fast, beautiful Markdown viewer **and editor** for Windows. Multi-tab, file si
 
 ### Viewing
 - **Beautiful rendering** — GitHub-flavored Markdown with tables, task lists, footnotes, strikethrough, alerts, and definition lists
-- **Diagrams & math** — Offline Mermaid diagrams and KaTeX formulas with no network dependency; drag horizontally to inspect wide diagrams
+- **Diagrams & math** — Offline Mermaid diagrams and KaTeX formulas with no network dependency; oversized diagrams start centered and can be dragged in any direction
 - **Syntax highlighting** — 50+ languages, line numbers, one-click copy
 - **Auto-embedded images** — Local images are inlined (both Markdown and HTML `<img>`)
 - **TOC sidebar** — Auto-built outline (h1/h2/h3) with active-section highlighting
