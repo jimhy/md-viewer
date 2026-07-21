@@ -1,0 +1,4 @@
+# 第三方压缩资源必须逐字节保留，避免 Windows 的 CRLF 转换破坏完整性校验。
+/assets/mermaid.min.js binary
+/assets/katex.min.js binary
+/assets/katex-inlined.css binary

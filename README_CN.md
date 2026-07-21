@@ -2,7 +2,7 @@
 
 # MD Viewer
 
-快速、美观的 Windows Markdown 查看器 **+ 编辑器**。多 Tab、文件侧栏、实时预览、语法高亮、粘贴即存图 —— Rust + WebView2 打造，安装包约 3 MB。
+快速、美观的 Windows Markdown 查看器 **+ 编辑器**。多 Tab、文件侧栏、实时预览、语法高亮、粘贴即存图 —— Rust + WebView2 打造的轻量原生应用。
 
 ![MD Viewer 截图](docs/screenshot2.png)
 
@@ -11,7 +11,8 @@
 ## 功能特性
 
 ### 查看
-- **精美渲染** — 支持 GitHub 风格 Markdown：表格、任务列表、脚注、删除线
+- **精美渲染** — 支持 GitHub 风格 Markdown：表格、任务列表、脚注、删除线、Alerts、定义列表
+- **图表与公式** — 离线渲染 Mermaid 图表和 KaTeX 数学公式，无需联网；超宽图表支持按住横向拖动查看
 - **语法高亮** — 50+ 种语言，带行号 + 一键复制
 - **自动内嵌图片** — 本地图片自动转 data URI（支持 Markdown 和 HTML `<img>` 两种写法）
 - **大纲侧栏** — 自动按 h1/h2/h3 生成目录，滚动时高亮当前章节
@@ -76,7 +77,7 @@
 
 ## 支持的 Markdown 语法
 
-标题 · 加粗 · 斜体 · 删除线 · 有序/无序/任务列表 · 表格 · 围栏代码块（语法高亮） · 引用 · 图片（本地/网络） · 链接 · 分隔线 · 内联 HTML（`<p>`、`<img>`、`<details>` 等）。
+标题 · 加粗 · 斜体 · 删除线 · 有序/无序/任务列表 · 表格 · 脚注 · 定义列表 · GitHub Alerts · Mermaid 图表 · KaTeX 行内/块级公式 · 围栏代码块（语法高亮） · 引用 · 图片（本地/网络） · 链接 · 分隔线 · 标题属性 · YAML/TOML 元数据块 · 内联 HTML（`<p>`、`<img>`、`<details>` 等）。
 
 ## 从源码构建
 
@@ -99,7 +100,7 @@ python release.py
 
 ## 技术栈
 
-- **Rust** — 启动快，安装包约 3 MB
+- **Rust** — 启动快、原生程序体积精简
 - **[wry](https://github.com/tauri-apps/wry)** — WebView2 封装
 - **[tao](https://github.com/tauri-apps/tao)** — 窗口管理
 - **[pulldown-cmark](https://github.com/raphlinus/pulldown-cmark)** — Markdown 解析

@@ -9,3 +9,10 @@ test_img.md
 /qa-shots/
 .ruff_cache/
 .engram/
+
+# KaTeX 内联样式生成过程中的临时资源；应用只嵌入 katex-inlined.css。
+/assets/katex.min.css
+/assets/katex_fonts_tmp/
+
+# 本地浏览器冒烟测试产物。
+/.playwright-cli/

@@ -1,21 +1,31 @@
 # 发布与自动更新
 
-## 一、发布新版本（GitHub Actions 自动编译+发版）
+## 一、发布新版本（GitHub 与 Gitee 双平台）
 
-流水线：`.github/workflows/release.yml`，在 **Windows runner** 上编译 release exe、用 Inno Setup 打安装包，并创建 GitHub Release、上传 `md-viewer-setup-v{版本}.exe`。
+流水线：`.github/workflows/release.yml`，在 **Windows runner** 上编译 release exe、用 Inno Setup 打安装包，并创建 GitHub Release、上传 `md-viewer-setup-v{版本}.exe`。Gitee Release 使用同一安装包手动发布，保证两个平台的文件完全一致。
 
 ### 标准发版步骤
 
-1. **升级版本号**：改 `Cargo.toml` 里的 `version`（可用现成的 `python release.py` 帮你 bump，或手动改）。
-2. **提交**：`git commit -am "release: vX.Y.Z"`。
-3. **打 tag 并推到 GitHub**（tag 用**纯版本号、无 `v` 前缀**，沿用历史约定）：
+1. **升级版本号**：同步修改 `Cargo.toml` 和 `Cargo.lock` 中本项目的 `version`（也可用 `python release.py` bump 后再检查）。
+2. **完整验证**：至少运行 `cargo test --locked` 和 `cargo build --release --locked`；涉及渲染或界面时还要做真实 WebView2 冒烟测试。
+3. **显式暂存并提交**：检查 `git status --short`，把新增资源文件一并 `git add`，不要只用 `git commit -am`，否则未跟踪文件不会进入提交。
+4. **先把 `main` 推到两个远端**：
    ```bash
-   git tag 1.0.17
-   git push github 1.0.17     # 注意是 github remote，不是 gitee 的 origin
+   git push github main
+   git push origin main
    ```
-4. 流水线自动触发 → 编译 → 打包 → 创建 Release `1.0.17` 并上传安装包。
+5. **分别创建并推送标签**（GitHub 无 `v`，Gitee 有 `v`）：
+   ```bash
+   git tag X.Y.Z
+   git tag vX.Y.Z
+   git push github X.Y.Z
+   git push origin vX.Y.Z
+   ```
+6. GitHub 流水线自动编译、打包并创建 Release `X.Y.Z`。等待成功后下载 `md-viewer-setup-vX.Y.Z.exe`，记录 SHA-256。
+7. 在 Gitee 为标签 `vX.Y.Z` 创建 Release，标题使用 `vX.Y.Z`，上传刚从 GitHub Release 下载的同一个安装包。
+8. 最终检查两个 Release 均可访问、安装包名称正确且 SHA-256 一致。
 
-> tag 必须与 `Cargo.toml` 的版本**完全一致**，否则流水线会在版本校验步骤失败（防止忘记 bump）。
+> GitHub tag 必须与 `Cargo.toml` 的版本**完全一致**且不带 `v`，否则流水线会在版本校验步骤失败。Gitee 继续沿用带 `v` 的历史命名。
 
 ### 手动触发（备用）
 
@@ -40,4 +50,4 @@ GitHub 网页 Actions → Release → Run workflow，可填版本号（留空则
 
 - 发布后，旧版本用户下次启动会在 ~4 秒后看到更新提示。
 - 若要「静默无感更新 + 自动重启」，可把 `installer.iss` 的 `RestartApplications` 改为 `yes` 并在 `run_update` 里给安装包加 `/SILENT` 参数（当前为带向导的可见安装）。
-- Release 的 tag 命名务必保持 `X.Y.Z`（无 `v`）以与历史一致；客户端版本比对对带不带 `v` 都兼容，但 tag 与 Cargo.toml 校验要求二者字面一致。
+- GitHub Release 的 tag 务必保持 `X.Y.Z`（无 `v`）；Gitee Release 使用 `vX.Y.Z`。客户端版本比对兼容两种形式。

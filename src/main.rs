@@ -29,6 +29,13 @@ const GITHUB_REPO: &str = "md-viewer";
 const GITEE_OWNER: &str = "jimyliu";
 const GITEE_REPO: &str = "md-viewer";
 
+// Keep the diagram/math renderers fully offline. The JavaScript bundles are
+// injected through WebView2's document-start hook instead of being placed in
+// `with_html`: Mermaid alone is larger than NavigateToString's ~2 MB limit.
+const MERMAID_JS: &str = include_str!("../assets/mermaid.min.js");
+const KATEX_JS: &str = include_str!("../assets/katex.min.js");
+const KATEX_CSS: &str = include_str!("../assets/katex-inlined.css");
+
 #[derive(Debug, Clone)]
 enum UserEvent {
     OpenFile(PathBuf),
@@ -404,6 +411,8 @@ fn main() {
     let state_for_loop = state.clone();
 
     let wv = WebViewBuilder::new()
+        .with_initialization_script(MERMAID_JS)
+        .with_initialization_script(KATEX_JS)
         .with_html(&html_content)
         .with_ipc_handler(move |msg| {
             let body = msg.body().to_string();
@@ -2323,6 +2332,7 @@ fn is_block_start_tag(tag: &Tag) -> bool {
             | Tag::CodeBlock(_)
             | Tag::List(_)
             | Tag::FootnoteDefinition(_)
+            | Tag::DefinitionList
             | Tag::Table(_)
             | Tag::HtmlBlock
             | Tag::MetadataBlock(_)
@@ -2338,6 +2348,7 @@ fn is_block_end_tag(tag: &TagEnd) -> bool {
             | TagEnd::CodeBlock
             | TagEnd::List(_)
             | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
             | TagEnd::Table
             | TagEnd::HtmlBlock
             | TagEnd::MetadataBlock(_)
@@ -2345,8 +2356,18 @@ fn is_block_end_tag(tag: &TagEnd) -> bool {
 }
 
 fn render_markdown_body(markdown: &str, base_dir: &str) -> String {
-    let mut options = Options::all();
-    options.remove(Options::ENABLE_SMART_PUNCTUATION);
+    // Do not use Options::all(): it also enables ENABLE_OLD_FOOTNOTES, which
+    // silently switches off pulldown-cmark's GitHub-compatible footnote mode.
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
+        | Options::ENABLE_MATH
+        | Options::ENABLE_GFM
+        | Options::ENABLE_DEFINITION_LIST;
 
     // Byte-offset -> line index, for tagging each top-level block with its source line.
     let line_starts: Vec<usize> = {
@@ -2408,19 +2429,40 @@ fn render_markdown_body(markdown: &str, base_dir: &str) -> String {
             if is_block_end_tag(tag_end) {
                 if matches!(tag_end, TagEnd::CodeBlock) {
                     in_code_block = false;
-                    let lang_token = if code_lang.is_empty() { "txt" } else { &code_lang };
-                    let syntax = ss
-                        .find_syntax_by_token(lang_token)
-                        .unwrap_or_else(|| ss.find_syntax_plain_text());
-                    let highlighted = highlighted_html_for_string(&code_text, &ss, syntax, theme)
+                    let lang_token = code_lang
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if lang_token == "mermaid" {
+                        html_body.push_str(&format!(
+                            "<pre class=\"mermaid-source\"><code>{}</code></pre>",
+                            html_escape(&code_text)
+                        ));
+                    } else {
+                        let syntax_token = if lang_token.is_empty() {
+                            "txt"
+                        } else {
+                            &lang_token
+                        };
+                        let syntax = ss
+                            .find_syntax_by_token(syntax_token)
+                            .unwrap_or_else(|| ss.find_syntax_plain_text());
+                        let highlighted = highlighted_html_for_string(
+                            &code_text,
+                            &ss,
+                            syntax,
+                            theme,
+                        )
                         .unwrap_or_else(|_| {
                             format!("<pre><code>{}</code></pre>", html_escape(&code_text))
                         });
-                    html_body.push_str(&format!(
-                        "<div class=\"syntect-block\" data-lang=\"{lang}\">{highlighted}</div>",
-                        lang = html_escape(&code_lang),
-                        highlighted = highlighted
-                    ));
+                        html_body.push_str(&format!(
+                            "<div class=\"syntect-block\" data-lang=\"{lang}\">{highlighted}</div>",
+                            lang = html_escape(&code_lang),
+                            highlighted = highlighted
+                        ));
+                    }
                 } else {
                     pulldown_cmark::html::push_html(&mut html_body, std::iter::once(event));
                 }
@@ -2515,6 +2557,7 @@ fn render_shell_page(state: &AppState, active_id: Option<u64>) -> String {
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <base id="docBase" href="">
 <title>MD Viewer</title>
+<style>{katex_css}</style>
 <style>
 :root {{
   --bg: #ffffff;
@@ -3616,6 +3659,106 @@ blockquote {{
 }}
 blockquote p:last-child {{ margin-bottom: 0; }}
 
+/* GitHub-style alerts emitted by pulldown-cmark's ENABLE_GFM extension. */
+blockquote[class^="markdown-alert-"] {{
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  color: var(--fg);
+}}
+blockquote[class^="markdown-alert-"]::before {{
+  display: block;
+  margin-bottom: 0.35em;
+  font-size: 0.82em;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}}
+.markdown-alert-note {{ border-left-color: #3b82f6 !important; }}
+.markdown-alert-note::before {{ content: "Note"; color: #3b82f6; }}
+.markdown-alert-tip {{ border-left-color: #22c55e !important; }}
+.markdown-alert-tip::before {{ content: "Tip"; color: #22c55e; }}
+.markdown-alert-important {{ border-left-color: #8b5cf6 !important; }}
+.markdown-alert-important::before {{ content: "Important"; color: #8b5cf6; }}
+.markdown-alert-warning {{ border-left-color: #f59e0b !important; }}
+.markdown-alert-warning::before {{ content: "Warning"; color: #d97706; }}
+.markdown-alert-caution {{ border-left-color: #ef4444 !important; }}
+.markdown-alert-caution::before {{ content: "Caution"; color: #ef4444; }}
+
+/* Definition lists (pulldown-cmark extension). */
+dl {{
+  margin: 0 0 1.2em 0;
+  padding: 0;
+}}
+dt {{
+  margin-top: 0.75em;
+  font-weight: 650;
+  color: var(--fg);
+}}
+dd {{
+  margin: 0.3em 0 0.75em 1.4em;
+  padding-left: 0.9em;
+  border-left: 2px solid var(--border);
+  color: var(--fg-secondary);
+}}
+
+/* Offline Mermaid diagrams. Wide diagrams scroll instead of shrinking until
+   their labels are unreadable, which is important for architecture charts. */
+.mermaid-source {{
+  display: none;
+}}
+.mermaid-diagram {{
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  margin: 0 0 1.2em 0;
+  padding: 1em;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  touch-action: pan-y;
+  background: var(--block-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}}
+.mermaid-diagram.can-pan {{ cursor: grab; }}
+.mermaid-diagram.is-panning {{
+  cursor: grabbing;
+  user-select: none;
+}}
+.mermaid-diagram.is-panning * {{ pointer-events: none; }}
+.mermaid-diagram svg {{
+  display: block;
+  min-width: 760px;
+  max-width: none !important;
+  height: auto;
+  margin: 0 auto;
+}}
+.mermaid-diagram.is-error {{
+  border-left: 4px solid #ef4444;
+}}
+.mermaid-error-title {{
+  margin-bottom: 0.5em;
+  color: #ef4444;
+  font-weight: 650;
+}}
+.mermaid-diagram.is-error pre {{
+  display: block;
+  padding: 0.8em 1em;
+  white-space: pre-wrap;
+}}
+
+/* KaTeX output is generated from pulldown-cmark's math events. */
+.math-display {{
+  display: block;
+  max-width: 100%;
+  margin: 1em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}}
+.math-inline[data-katex-error] {{
+  color: #ef4444;
+}}
+
 table {{
   width: 100%;
   border-collapse: collapse;
@@ -3676,6 +3819,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
   body {{ background: #fff; color: #000; }}
   .container {{ max-width: 100%; padding: 20px; }}
   pre {{ box-shadow: none; border: 1px solid #ddd; }}
+  .mermaid-diagram {{ overflow: visible; box-shadow: none; }}
+  .mermaid-diagram svg {{ min-width: 0; max-width: 100% !important; }}
 }}
 </style>
 </head>
@@ -3958,10 +4103,174 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }}
   }}
 
+  let previewRenderVersion = 0;
+  let mermaidSequence = 0;
+  let mermaidInitialized = false;
+  const mermaidPanBound = new WeakSet();
+
+  function updateMermaidPanState(holder) {{
+    const canPan = holder.scrollWidth > holder.clientWidth + 1;
+    holder.classList.toggle('can-pan', canPan);
+    if (!canPan) holder.classList.remove('is-panning');
+  }}
+
+  function bindMermaidPan(holder) {{
+    if (mermaidPanBound.has(holder)) {{
+      updateMermaidPanState(holder);
+      return;
+    }}
+    mermaidPanBound.add(holder);
+    let pointerId = null;
+    let startX = 0;
+    let startScrollLeft = 0;
+    let moved = false;
+
+    holder.addEventListener('pointerdown', (event) => {{
+      updateMermaidPanState(holder);
+      if (event.button !== 0 || !holder.classList.contains('can-pan')) return;
+      pointerId = event.pointerId;
+      startX = event.clientX;
+      startScrollLeft = holder.scrollLeft;
+      moved = false;
+      try {{ holder.setPointerCapture(pointerId); }} catch (_) {{}}
+      event.preventDefault();
+    }});
+
+    holder.addEventListener('pointermove', (event) => {{
+      if (pointerId === null || event.pointerId !== pointerId) return;
+      const distance = event.clientX - startX;
+      if (!moved && Math.abs(distance) < 3) return;
+      moved = true;
+      holder.classList.add('is-panning');
+      holder.scrollLeft = startScrollLeft - distance;
+      event.preventDefault();
+    }});
+
+    const finishPan = (event) => {{
+      if (pointerId === null || (event.pointerId !== undefined && event.pointerId !== pointerId)) return;
+      const completedPointerId = pointerId;
+      pointerId = null;
+      try {{ holder.releasePointerCapture(completedPointerId); }} catch (_) {{}}
+      holder.classList.remove('is-panning');
+    }};
+    holder.addEventListener('pointerup', finishPan);
+    holder.addEventListener('pointercancel', finishPan);
+    holder.addEventListener('lostpointercapture', finishPan);
+    holder.addEventListener('dragstart', event => event.preventDefault());
+    updateMermaidPanState(holder);
+  }}
+
+  function renderMath(root) {{
+    if (!window.katex || typeof window.katex.render !== 'function') return;
+    root.querySelectorAll('.math-inline, .math-display').forEach(el => {{
+      if (el.dataset.katexRendered === '1') return;
+      const tex = el.textContent || '';
+      try {{
+        window.katex.render(tex, el, {{
+          displayMode: el.classList.contains('math-display'),
+          throwOnError: false,
+          strict: 'warn',
+          trust: false,
+        }});
+        el.dataset.katexRendered = '1';
+      }} catch (err) {{
+        el.dataset.katexError = '1';
+        el.title = err && err.message ? err.message : 'KaTeX render error';
+      }}
+    }});
+  }}
+
+  function ensureMermaidInitialized() {{
+    if (!window.mermaid || typeof window.mermaid.render !== 'function') return false;
+    if (!mermaidInitialized) {{
+      const isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      window.mermaid.initialize({{
+        startOnLoad: false,
+        securityLevel: 'strict',
+        theme: isDark ? 'dark' : 'default',
+        flowchart: {{ useMaxWidth: false, htmlLabels: true }},
+      }});
+      mermaidInitialized = true;
+    }}
+    return true;
+  }}
+
+  async function renderMermaid(root, version) {{
+    const sources = Array.from(root.querySelectorAll('pre.mermaid-source'));
+    if (sources.length === 0) return;
+    const rendererReady = ensureMermaidInitialized();
+
+    for (const source of sources) {{
+      if (version !== previewRenderVersion || !source.isConnected) return;
+      const diagramText = source.textContent || '';
+      const holder = document.createElement('div');
+      holder.className = 'mermaid-diagram';
+
+      if (!rendererReady) {{
+        holder.classList.add('is-error');
+        const title = document.createElement('div');
+        title.className = 'mermaid-error-title';
+        title.textContent = 'Mermaid renderer is unavailable';
+        const fallback = document.createElement('pre');
+        fallback.textContent = diagramText;
+        holder.appendChild(title);
+        holder.appendChild(fallback);
+        source.replaceWith(holder);
+        bindMermaidPan(holder);
+        continue;
+      }}
+
+      try {{
+        const renderId = 'mdvMermaid' + Date.now() + '_' + (++mermaidSequence);
+        const result = await window.mermaid.render(renderId, diagramText);
+        if (version !== previewRenderVersion || !source.isConnected) return;
+        holder.innerHTML = result.svg;
+        source.replaceWith(holder);
+        bindMermaidPan(holder);
+        if (typeof result.bindFunctions === 'function') result.bindFunctions(holder);
+      }} catch (err) {{
+        if (version !== previewRenderVersion || !source.isConnected) return;
+        holder.classList.add('is-error');
+        const title = document.createElement('div');
+        title.className = 'mermaid-error-title';
+        title.textContent = err && err.message ? err.message : 'Mermaid render error';
+        const fallback = document.createElement('pre');
+        fallback.textContent = diagramText;
+        holder.appendChild(title);
+        holder.appendChild(fallback);
+        source.replaceWith(holder);
+        bindMermaidPan(holder);
+      }}
+    }}
+  }}
+
+  function cacheRenderedPreview(root, version) {{
+    if (version !== previewRenderVersion || root !== previewContainer || activeId === null) return;
+    const doc = docs.get(activeId);
+    if (doc) doc.enhancedHtml = root.innerHTML;
+  }}
+
+  function renderAdvancedMarkdown(root, version) {{
+    renderMath(root);
+    root.querySelectorAll('.mermaid-diagram').forEach(bindMermaidPan);
+    renderMermaid(root, version).then(() => {{
+      if (version !== previewRenderVersion) return;
+      if (mode === 'view') buildTOC();
+      if (mode === 'split') highlightCursorBlock();
+      cacheRenderedPreview(root, version);
+    }}).catch(err => console.warn('Advanced Markdown render failed', err));
+  }}
+
+  window.addEventListener('resize', () => {{
+    previewContainer.querySelectorAll('.mermaid-diagram').forEach(updateMermaidPanState);
+  }});
+
   function setPreviewHtml(html, preserveScroll) {{
+    const version = ++previewRenderVersion;
     const prev = preserveScroll ? mainScroll.scrollTop : 0;
     previewContainer.innerHTML = html;
     enhanceCodeBlocks(previewContainer);
+    renderAdvancedMarkdown(previewContainer, version);
     if (mode === 'view') buildTOC();
     if (preserveScroll) mainScroll.scrollTop = prev;
     if (mode === 'split') highlightCursorBlock();
@@ -3970,15 +4279,18 @@ summary {{ cursor: pointer; font-weight: 600; }}
   // Cached version: take pre-enhanced HTML (already wrapped code blocks) and
   // skip the heavy DOM-mutation pass — just rebind the copy buttons.
   function setPreviewHtmlCached(cached, preserveScroll) {{
+    const version = ++previewRenderVersion;
     const prev = preserveScroll ? mainScroll.scrollTop : 0;
     previewContainer.innerHTML = cached;
     previewContainer.querySelectorAll('.code-wrapper').forEach(bindCopyButton);
+    renderAdvancedMarkdown(previewContainer, version);
     if (mode === 'view') buildTOC();
     if (preserveScroll) mainScroll.scrollTop = prev;
     if (mode === 'split') highlightCursorBlock();
   }}
 
   function showEmptyState() {{
+    ++previewRenderVersion;
     activeId = null;
     contentArea.classList.add('no-doc');
     modeGroup.classList.add('disabled');
@@ -4007,7 +4319,6 @@ summary {{ cursor: pointer; font-weight: 600; }}
       setPreviewHtmlCached(doc.enhancedHtml, false);
     }} else {{
       setPreviewHtml(doc.htmlBody, false);
-      doc.enhancedHtml = previewContainer.innerHTML;
     }}
     // The cached HTML may predate edits made while the preview was hidden.
     // Refresh from source when the preview is visible.
@@ -4151,7 +4462,6 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }} else {{
       if (editorTA.value !== doc.markdown) editorTA.value = doc.markdown;
       setPreviewHtml(doc.htmlBody, false);
-      doc.enhancedHtml = previewContainer.innerHTML;
     }}
     // Preview replacement: don't re-scan, but re-render so the gray highlight
     // follows the new file. Permanent replacement may need re-scan.
@@ -4214,7 +4524,6 @@ summary {{ cursor: pointer; font-weight: 600; }}
       setBaseHref(doc.baseDir);
       updateWindowTitle(doc.name);
       setPreviewHtml(doc.htmlBody, true);
-      doc.enhancedHtml = previewContainer.innerHTML;
       updateReloadBanner();
       if (sidebarPane === 'files') requestFileTree();
     }}
@@ -4259,7 +4568,6 @@ summary {{ cursor: pointer; font-weight: 600; }}
     }}
     if (activeId === id) {{
       setPreviewHtml(html, true);
-      if (doc) doc.enhancedHtml = previewContainer.innerHTML;
     }}
   }}
 
@@ -4286,7 +4594,6 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (activeId === id) {{
       if (editorTA.value !== newMd) editorTA.value = newMd;
       setPreviewHtml(newHtml, true);
-      doc.enhancedHtml = previewContainer.innerHTML;
       updateReloadBanner();
     }}
   }}
@@ -4312,7 +4619,6 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (activeId === doc.id) {{
       if (editorTA.value !== newMd) editorTA.value = newMd;
       setPreviewHtml(newHtml, true);
-      doc.enhancedHtml = previewContainer.innerHTML;
     }}
     renderTabBar();
     updateReloadBanner();
@@ -6075,5 +6381,44 @@ summary {{ cursor: pointer; font-weight: 600; }}
         ver = ver,
         docs_js = docs_js,
         active_js = active_js,
+        katex_css = KATEX_CSS,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_markdown_body;
+
+    #[test]
+    fn mermaid_fence_is_emitted_as_diagram_source() {
+        let html = render_markdown_body("```mermaid\nflowchart LR\nA --> B\n```", "");
+        assert!(html.contains("class=\"mermaid-source\""));
+        assert!(html.contains("flowchart LR\nA --&gt; B"));
+        assert!(!html.contains("class=\"syntect-block\""));
+    }
+
+    #[test]
+    fn math_events_are_preserved_for_katex() {
+        let html = render_markdown_body("Inline $x^2$ and display:\n\n$$E = mc^2$$", "");
+        assert!(html.contains("class=\"math math-inline\">x^2</span>"));
+        assert!(html.contains("class=\"math math-display\">E = mc^2</span>"));
+    }
+
+    #[test]
+    fn gfm_alerts_and_definition_lists_render() {
+        let markdown = "> [!NOTE]\n> Alert body\n\nTerm\n: Definition";
+        let html = render_markdown_body(markdown, "");
+        assert!(html.contains("class=\"markdown-alert-note\""));
+        assert!(html.contains("<dl>"));
+        assert!(html.contains("<dt>Term</dt>"));
+        assert!(html.contains("<dd>Definition</dd>"));
+    }
+
+    #[test]
+    fn github_footnote_mode_is_used() {
+        let html = render_markdown_body("Reference[^note].\n\n[^note]: Footnote body", "");
+        assert!(html.contains("footnote-reference"));
+        assert!(html.contains("footnote-definition"));
+        assert!(html.contains("Footnote body"));
+    }
 }

@@ -2,7 +2,7 @@
 
 # MD Viewer
 
-A fast, beautiful Markdown viewer **and editor** for Windows. Multi-tab, file sidebar, live preview, syntax highlighting, paste-to-save images — all in a ~3 MB native app powered by Rust + WebView2.
+A fast, beautiful Markdown viewer **and editor** for Windows. Multi-tab, file sidebar, live preview, syntax highlighting, paste-to-save images — all in a compact native app powered by Rust + WebView2.
 
 
 ![MD Viewer screenshot](docs/screenshot1.png)
@@ -11,7 +11,8 @@ A fast, beautiful Markdown viewer **and editor** for Windows. Multi-tab, file si
 ## Features
 
 ### Viewing
-- **Beautiful rendering** — GitHub-flavored Markdown with tables, task lists, footnotes, strikethrough
+- **Beautiful rendering** — GitHub-flavored Markdown with tables, task lists, footnotes, strikethrough, alerts, and definition lists
+- **Diagrams & math** — Offline Mermaid diagrams and KaTeX formulas with no network dependency; drag horizontally to inspect wide diagrams
 - **Syntax highlighting** — 50+ languages, line numbers, one-click copy
 - **Auto-embedded images** — Local images are inlined (both Markdown and HTML `<img>`)
 - **TOC sidebar** — Auto-built outline (h1/h2/h3) with active-section highlighting
@@ -76,7 +77,7 @@ A fast, beautiful Markdown viewer **and editor** for Windows. Multi-tab, file si
 
 ## Supported Markdown
 
-Headings · bold · italic · strikethrough · ordered / unordered / task lists · tables · fenced code blocks with syntax highlighting · blockquotes · images (local & remote) · links · horizontal rules · inline HTML (`<p>`, `<img>`, `<details>`, …).
+Headings · bold · italic · strikethrough · ordered / unordered / task lists · tables · footnotes · definition lists · GitHub alerts · Mermaid diagrams · inline/display KaTeX math · fenced code blocks with syntax highlighting · blockquotes · images (local & remote) · links · horizontal rules · heading attributes · YAML/TOML metadata blocks · inline HTML (`<p>`, `<img>`, `<details>`, …).
 
 ## Build from source
 
@@ -99,7 +100,7 @@ Bumps the patch version in `Cargo.toml`, builds release, then invokes Inno Setup
 
 ## Tech stack
 
-- **Rust** — fast startup, ~3 MB binary
+- **Rust** — fast startup and a compact native binary
 - **[wry](https://github.com/tauri-apps/wry)** — WebView2 bindings
 - **[tao](https://github.com/tauri-apps/tao)** — windowing
 - **[pulldown-cmark](https://github.com/raphlinus/pulldown-cmark)** — Markdown parsing

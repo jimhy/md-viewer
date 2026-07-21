@@ -54,6 +54,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "md-viewer.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE";       DestDir: "{app}"; Flags: ignoreversion
+Source: "THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md";     DestDir: "{app}"; Flags: ignoreversion
 Source: "README_CN.md";  DestDir: "{app}"; Flags: ignoreversion
 
