@@ -1315,6 +1315,60 @@ fn handle_ipc(
         return;
     }
 
+    if let Some(rest) = body.strip_prefix("save-as:") {
+        if let Some((id_str, md_b64)) = rest.split_once(':') {
+            if let Ok(id) = id_str.parse::<u64>() {
+                if let Ok(md_bytes) = base64_decode(md_b64) {
+                    if let Ok(markdown) = String::from_utf8(md_bytes) {
+                        let default_name = {
+                            let s = state.borrow();
+                            s.find(id).map(|d| {
+                                if d.is_untitled() {
+                                    format!("{}.md", d.name)
+                                } else {
+                                    d.name.clone()
+                                }
+                            })
+                        };
+                        if let Some(default_name) = default_name {
+                            let script = match show_save_dialog(hwnd, &default_name) {
+                                Some(target)
+                                    if state.borrow().is_path_open_elsewhere(id, &target) =>
+                                {
+                                    show_error(&path_already_open_msg(&target));
+                                    format!("window.mdv && mdv.saveCancelled({});", id)
+                                }
+                                Some(target) => {
+                                    match state.borrow_mut().save_as(id, &target, &markdown) {
+                                        Some((new_name, new_base)) => {
+                                            let html_body =
+                                                render_markdown_body(&markdown, &new_base);
+                                            format!(
+                                                "window.mdv && mdv.markSavedAs({}, '{}', '{}', '{}');",
+                                                id,
+                                                base64_encode(new_name.as_bytes()),
+                                                base64_encode(new_base.as_bytes()),
+                                                base64_encode(html_body.as_bytes()),
+                                            )
+                                        }
+                                        None => {
+                                            format!("window.mdv && mdv.saveFailed({});", id)
+                                        }
+                                    }
+                                }
+                                None => format!("window.mdv && mdv.saveCancelled({});", id),
+                            };
+                            if let Some(wv) = webview.borrow().as_ref() {
+                                let _ = wv.evaluate_script(&script);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if let Some(rest) = body.strip_prefix("save:") {
         if let Some((id_str, md_b64)) = rest.split_once(':') {
             if let Ok(id) = id_str.parse::<u64>() {
@@ -3946,46 +4000,98 @@ dd {{
 }}
 .mermaid-diagram {{
   box-sizing: border-box;
+  position: relative;
   width: 100%;
   max-width: 100%;
-  max-height: min(72vh, 900px);
   margin: 0 0 1.2em 0;
-  padding: 1em;
-  overflow: auto;
+  padding: 0;
+  overflow: hidden;
   overscroll-behavior-x: contain;
   overscroll-behavior-y: auto;
-  touch-action: pan-x pan-y;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
   background: var(--block-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
 }}
-.mermaid-diagram::-webkit-scrollbar {{
+.mermaid-viewport {{
+  box-sizing: border-box;
+  width: 100%;
+  max-height: min(72vh, 900px);
+  padding: 1em;
+  overflow: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-x pan-y;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}}
+.mermaid-viewport::-webkit-scrollbar {{
   display: none;
   width: 0;
   height: 0;
 }}
-.mermaid-diagram.can-pan {{
+.mermaid-diagram.can-pan .mermaid-viewport {{
   cursor: grab;
 }}
-.mermaid-diagram.is-panning {{
+.mermaid-diagram.is-panning .mermaid-viewport {{
   cursor: grabbing;
   user-select: none;
 }}
 .mermaid-diagram.is-panning * {{ pointer-events: none; }}
+.mermaid-canvas {{
+  display: block;
+  margin: 0 auto;
+}}
 .mermaid-diagram svg {{
   display: block;
-  min-width: 760px;
+  width: 100%;
+  min-width: 0;
   max-width: none !important;
   height: auto;
   margin: 0 auto;
 }}
+.mermaid-zoom-controls {{
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  z-index: 8;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.12);
+  backdrop-filter: blur(6px);
+}}
+.mermaid-zoom-btn {{
+  height: 26px;
+  min-width: 28px;
+  padding: 0 7px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg-secondary);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 16px;
+  line-height: 1;
+}}
+.mermaid-zoom-btn:hover:not(:disabled) {{ background: var(--btn-hover); color: var(--fg); }}
+.mermaid-zoom-btn:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 1px; }}
+.mermaid-zoom-btn:disabled {{ cursor: default; opacity: .35; }}
+.mermaid-zoom-value {{
+  min-width: 50px;
+  font-size: 11px;
+  font-weight: 650;
+}}
 .mermaid-diagram.is-error {{
+  padding: 1em;
+  overflow: auto;
   border-left: 4px solid #ef4444;
 }}
 .mermaid-diagram.is-pending {{
+  padding: 1em;
+  overflow: auto;
   border-left: 4px solid var(--accent);
 }}
 .mermaid-error-title {{
@@ -4090,6 +4196,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
   img {{ break-inside: avoid; max-width: 100% !important; }}
   pre {{ box-shadow: none; border: 1px solid #ddd; }}
   .mermaid-diagram {{ max-height: none; overflow: visible; box-shadow: none; }}
+  .mermaid-viewport {{ max-height: none; padding: 0; overflow: visible; }}
+  .mermaid-zoom-controls {{ display: none !important; }}
+  .mermaid-canvas {{ width: 100% !important; }}
   .mermaid-diagram svg {{ min-width: 0; max-width: 100% !important; }}
 }}
 </style>
@@ -4399,21 +4508,128 @@ summary {{ cursor: pointer; font-weight: 600; }}
   let mermaidSequence = 0;
   let mermaidInitialized = false;
   const mermaidPanBound = new WeakSet();
+  const MERMAID_ZOOM_MIN = 0.5;
+  const MERMAID_ZOOM_MAX = 3;
+  const MERMAID_ZOOM_STEP = 0.25;
+
+  function getMermaidViewport(holder) {{
+    return holder.querySelector(':scope > .mermaid-viewport');
+  }}
 
   function updateMermaidPanState(holder) {{
-    const canPan = holder.scrollWidth > holder.clientWidth + 1 ||
-      holder.scrollHeight > holder.clientHeight + 1;
+    const viewport = getMermaidViewport(holder);
+    if (!viewport) {{
+      holder.classList.remove('can-pan', 'is-panning');
+      return;
+    }}
+    const canPan = viewport.scrollWidth > viewport.clientWidth + 1 ||
+      viewport.scrollHeight > viewport.clientHeight + 1;
     holder.classList.toggle('can-pan', canPan);
     if (!canPan) holder.classList.remove('is-panning');
   }}
 
   function centerMermaidViewport(holder) {{
-    holder.scrollLeft = Math.max(0, (holder.scrollWidth - holder.clientWidth) / 2);
-    holder.scrollTop = Math.max(0, (holder.scrollHeight - holder.clientHeight) / 2);
+    const viewport = getMermaidViewport(holder);
+    if (!viewport) return;
+    viewport.scrollLeft = Math.max(0, (viewport.scrollWidth - viewport.clientWidth) / 2);
+    viewport.scrollTop = Math.max(0, (viewport.scrollHeight - viewport.clientHeight) / 2);
+  }}
+
+  function setMermaidZoom(holder, requestedZoom, preserveCenter) {{
+    const viewport = getMermaidViewport(holder);
+    const canvas = viewport && viewport.querySelector(':scope > .mermaid-canvas');
+    if (!viewport || !canvas) return;
+    const oldZoom = Number(holder.dataset.mermaidZoom) || 1;
+    const zoom = Math.min(MERMAID_ZOOM_MAX, Math.max(MERMAID_ZOOM_MIN, requestedZoom));
+    const baseWidth = Number(holder.dataset.mermaidBaseWidth) || canvas.getBoundingClientRect().width;
+    const centerX = viewport.scrollLeft + viewport.clientWidth / 2;
+    const centerY = viewport.scrollTop + viewport.clientHeight / 2;
+
+    canvas.style.width = Math.round(baseWidth * zoom) + 'px';
+    holder.dataset.mermaidZoom = String(zoom);
+    // Force layout before restoring the viewport center at the new scale.
+    void canvas.offsetWidth;
+    if (preserveCenter !== false) {{
+      const ratio = zoom / oldZoom;
+      viewport.scrollLeft = Math.max(0, centerX * ratio - viewport.clientWidth / 2);
+      viewport.scrollTop = Math.max(0, centerY * ratio - viewport.clientHeight / 2);
+    }}
+
+    const value = holder.querySelector('[data-zoom-action="reset"]');
+    const zoomOut = holder.querySelector('[data-zoom-action="out"]');
+    const zoomIn = holder.querySelector('[data-zoom-action="in"]');
+    if (value) value.textContent = Math.round(zoom * 100) + '%';
+    if (zoomOut) zoomOut.disabled = zoom <= MERMAID_ZOOM_MIN;
+    if (zoomIn) zoomIn.disabled = zoom >= MERMAID_ZOOM_MAX;
+    updateMermaidPanState(holder);
+  }}
+
+  function makeMermaidZoomButton(action, label, text, extraClass) {{
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'mermaid-zoom-btn' + (extraClass ? (' ' + extraClass) : '');
+    button.dataset.zoomAction = action;
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.textContent = text;
+    return button;
+  }}
+
+  function ensureMermaidViewer(holder) {{
+    let viewport = getMermaidViewport(holder);
+    if (!viewport) {{
+      const svg = holder.querySelector(':scope > svg');
+      if (!svg) return null;
+      const viewBox = (svg.getAttribute('viewBox') || '').trim().split(/\s+/).map(Number);
+      const viewBoxWidth = viewBox.length === 4 && Number.isFinite(viewBox[2]) ? viewBox[2] : 0;
+      const rawWidth = svg.getAttribute('width') || '';
+      const attributeWidth = /^\d+(\.\d+)?(px)?$/.test(rawWidth) ? parseFloat(rawWidth) : 0;
+      const renderedWidth = svg.getBoundingClientRect().width;
+      const baseWidth = Math.max(320, viewBoxWidth, attributeWidth, renderedWidth);
+
+      viewport = document.createElement('div');
+      viewport.className = 'mermaid-viewport';
+      const canvas = document.createElement('div');
+      canvas.className = 'mermaid-canvas';
+      svg.replaceWith(viewport);
+      viewport.appendChild(canvas);
+      canvas.appendChild(svg);
+      holder.dataset.mermaidBaseWidth = String(baseWidth);
+    }}
+
+    const existingControls = holder.querySelector(':scope > .mermaid-zoom-controls');
+    if (existingControls) existingControls.remove();
+    const controls = document.createElement('div');
+    controls.className = 'mermaid-zoom-controls';
+    controls.setAttribute('role', 'group');
+    controls.setAttribute('aria-label', '图表缩放');
+    const zoomOut = makeMermaidZoomButton('out', '缩小图表', '−', '');
+    const reset = makeMermaidZoomButton('reset', '重置图表缩放', '100%', 'mermaid-zoom-value');
+    const zoomIn = makeMermaidZoomButton('in', '放大图表', '+', '');
+    controls.append(zoomOut, reset, zoomIn);
+    holder.appendChild(controls);
+
+    zoomOut.addEventListener('click', () => {{
+      setMermaidZoom(holder, (Number(holder.dataset.mermaidZoom) || 1) - MERMAID_ZOOM_STEP, true);
+    }});
+    reset.addEventListener('click', () => {{
+      setMermaidZoom(holder, 1, false);
+      centerMermaidViewport(holder);
+    }});
+    zoomIn.addEventListener('click', () => {{
+      setMermaidZoom(holder, (Number(holder.dataset.mermaidZoom) || 1) + MERMAID_ZOOM_STEP, true);
+    }});
+    setMermaidZoom(holder, 1, false);
+    return viewport;
   }}
 
   function bindMermaidPan(holder) {{
     if (mermaidPanBound.has(holder)) {{
+      updateMermaidPanState(holder);
+      return;
+    }}
+    const viewport = ensureMermaidViewer(holder);
+    if (!viewport) {{
       updateMermaidPanState(holder);
       return;
     }}
@@ -4425,29 +4641,29 @@ summary {{ cursor: pointer; font-weight: 600; }}
     let startScrollTop = 0;
     let moved = false;
 
-    holder.addEventListener('pointerdown', (event) => {{
+    viewport.addEventListener('pointerdown', (event) => {{
       updateMermaidPanState(holder);
       if (event.button !== 0 || event.pointerType === 'touch' ||
           !holder.classList.contains('can-pan')) return;
       pointerId = event.pointerId;
       startX = event.clientX;
       startY = event.clientY;
-      startScrollLeft = holder.scrollLeft;
-      startScrollTop = holder.scrollTop;
+      startScrollLeft = viewport.scrollLeft;
+      startScrollTop = viewport.scrollTop;
       moved = false;
-      try {{ holder.setPointerCapture(pointerId); }} catch (_) {{}}
+      try {{ viewport.setPointerCapture(pointerId); }} catch (_) {{}}
       event.preventDefault();
     }});
 
-    holder.addEventListener('pointermove', (event) => {{
+    viewport.addEventListener('pointermove', (event) => {{
       if (pointerId === null || event.pointerId !== pointerId) return;
       const distanceX = event.clientX - startX;
       const distanceY = event.clientY - startY;
       if (!moved && Math.max(Math.abs(distanceX), Math.abs(distanceY)) < 3) return;
       moved = true;
       holder.classList.add('is-panning');
-      holder.scrollLeft = startScrollLeft - distanceX;
-      holder.scrollTop = startScrollTop - distanceY;
+      viewport.scrollLeft = startScrollLeft - distanceX;
+      viewport.scrollTop = startScrollTop - distanceY;
       event.preventDefault();
     }});
 
@@ -4455,13 +4671,23 @@ summary {{ cursor: pointer; font-weight: 600; }}
       if (pointerId === null || (event.pointerId !== undefined && event.pointerId !== pointerId)) return;
       const completedPointerId = pointerId;
       pointerId = null;
-      try {{ holder.releasePointerCapture(completedPointerId); }} catch (_) {{}}
+      try {{ viewport.releasePointerCapture(completedPointerId); }} catch (_) {{}}
       holder.classList.remove('is-panning');
     }};
-    holder.addEventListener('pointerup', finishPan);
-    holder.addEventListener('pointercancel', finishPan);
-    holder.addEventListener('lostpointercapture', finishPan);
-    holder.addEventListener('dragstart', event => event.preventDefault());
+    viewport.addEventListener('pointerup', finishPan);
+    viewport.addEventListener('pointercancel', finishPan);
+    viewport.addEventListener('lostpointercapture', finishPan);
+    viewport.addEventListener('dragstart', event => event.preventDefault());
+    viewport.addEventListener('wheel', (event) => {{
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      const direction = event.deltaY < 0 ? 1 : -1;
+      setMermaidZoom(
+        holder,
+        (Number(holder.dataset.mermaidZoom) || 1) + direction * MERMAID_ZOOM_STEP,
+        true
+      );
+    }}, {{ passive: false }});
     updateMermaidPanState(holder);
     centerMermaidViewport(holder);
   }}
@@ -4912,6 +5138,18 @@ summary {{ cursor: pointer; font-weight: 600; }}
     // host's write-complete callback).
     doc.pendingSaveSnapshot = doc.markdown;
     try {{ window.ipc.postMessage('save:' + activeId + ':' + encB64(doc.markdown)); }} catch(_) {{}}
+  }}
+
+  function saveActiveAs() {{
+    if (activeId === null) return;
+    const doc = docs.get(activeId);
+    if (!doc) return;
+    doc.pendingSaveSnapshot = doc.markdown;
+    try {{
+      window.ipc.postMessage('save-as:' + activeId + ':' + encB64(doc.markdown));
+    }} catch (_) {{
+      doc.pendingSaveSnapshot = undefined;
+    }}
   }}
 
   function requestPdfExport() {{
@@ -6756,6 +6994,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 
     // New / Save / Open
     if (!shift && !alt && k === 'n') {{ stop(); createNewDoc(); return; }}
+    if (shift && !alt && k === 's') {{ stop(); saveActiveAs(); return; }}
     if (!shift && !alt && k === 's') {{ stop(); saveActive(); return; }}
     if (!shift && !alt && k === 'o') {{ stop(); try {{ window.ipc.postMessage('open-dialog'); }} catch(_) {{}} return; }}
 
@@ -6910,5 +7149,24 @@ mod tests {
         assert_eq!(pdf_default_name("架构图.md"), "架构图.pdf");
         assert_eq!(pdf_default_name("未命名1"), "未命名1.pdf");
         assert_eq!(pdf_default_name(""), "document.pdf");
+    }
+
+    #[test]
+    fn save_as_shortcut_posts_dedicated_ipc_message() {
+        let shell = render_shell_page(&AppState::new(), None);
+        assert!(shell.contains("function saveActiveAs()"));
+        assert!(shell.contains("'save-as:' + activeId + ':' + encB64(doc.markdown)"));
+        assert!(shell.contains("if (shift && !alt && k === 's')"));
+    }
+
+    #[test]
+    fn mermaid_viewer_has_accessible_zoom_controls() {
+        let shell = render_shell_page(&AppState::new(), None);
+        assert!(shell.contains("const MERMAID_ZOOM_MIN = 0.5;"));
+        assert!(shell.contains("const MERMAID_ZOOM_MAX = 3;"));
+        assert!(shell.contains("controls.setAttribute('aria-label', '图表缩放')"));
+        assert!(shell.contains("makeMermaidZoomButton('out', '缩小图表'"));
+        assert!(shell.contains("makeMermaidZoomButton('in', '放大图表'"));
+        assert!(shell.contains("if (!event.ctrlKey) return;"));
     }
 }
