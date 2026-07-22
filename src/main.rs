@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::thread;
@@ -19,7 +19,12 @@ use tao::event::{Event as WinEvent, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
 use std::sync::{Arc, Mutex};
-use wry::{PageLoadEvent, WebViewBuilder};
+use webview2_com::{
+    Microsoft::Web::WebView2::Win32::{ICoreWebView2PrintSettings, ICoreWebView2_7},
+    PrintToPdfCompletedHandler,
+};
+use windows::core::{Interface, PCWSTR};
+use wry::{PageLoadEvent, WebViewBuilder, WebViewExtWindows};
 
 /// Repos the auto-updater queries for the latest release. Both GitHub and Gitee
 /// are checked in parallel; whichever responds first wins (so users behind the
@@ -50,6 +55,12 @@ enum UserEvent {
     },
     /// The update download failed after the user asked to install it.
     UpdateFailed,
+    /// WebView2 finished its asynchronous PDF write. The main event loop owns
+    /// all UI updates so the IPC callback never blocks waiting for WebView2.
+    PdfExportFinished {
+        target: PathBuf,
+        error: Option<String>,
+    },
 }
 
 struct Doc {
@@ -591,6 +602,22 @@ fn main() {
                     let _ = wv.evaluate_script("window.mdv && mdv.updateFailed();");
                 }
             }
+            WinEvent::UserEvent(UserEvent::PdfExportFinished { target, error }) => {
+                if let Some(err) = error {
+                    show_error(&format!("PDF 导出失败：\n\n{}", err));
+                    if let Some(wv) = webview_for_loop.borrow().as_ref() {
+                        let _ = wv.evaluate_script(
+                            "window.mdv && mdv.pdfExportFinished(false, '');",
+                        );
+                    }
+                } else if let Some(wv) = webview_for_loop.borrow().as_ref() {
+                    let path_b64 = base64_encode(target.to_string_lossy().as_bytes());
+                    let _ = wv.evaluate_script(&format!(
+                        "window.mdv && mdv.pdfExportFinished(true, '{}');",
+                        path_b64
+                    ));
+                }
+            }
             WinEvent::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
@@ -689,6 +716,80 @@ fn handle_ipc(
                         }
                     }
                 }
+            }
+        }
+        return;
+    }
+
+    if let Some(rest) = body.strip_prefix("prepare-pdf-export:") {
+        if let Some((id_str, md_b64)) = rest.split_once(':') {
+            if let Ok(id) = id_str.parse::<u64>() {
+                if let Ok(md_bytes) = base64_decode(md_b64) {
+                    if let Ok(markdown) = String::from_utf8(md_bytes) {
+                        let base_dir = {
+                            let s = state.borrow();
+                            s.find(id).map(|d| d.base_dir.clone()).unwrap_or_default()
+                        };
+                        let html_body = render_markdown_body(&markdown, &base_dir);
+                        state.borrow_mut().update_markdown(id, markdown);
+                        let script = format!(
+                            "window.mdv && mdv.preparePdfExport({}, '{}');",
+                            id,
+                            base64_encode(html_body.as_bytes())
+                        );
+                        if let Some(wv) = webview.borrow().as_ref() {
+                            let _ = wv.evaluate_script(&script);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(wv) = webview.borrow().as_ref() {
+            let _ = wv.evaluate_script(
+                "window.mdv && mdv.pdfExportFinished(false, 'PDF export preparation failed');",
+            );
+        }
+        return;
+    }
+
+    if let Some(id_str) = body.strip_prefix("pdf-export-ready:") {
+        let id = match id_str.parse::<u64>() {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        let default_name = {
+            let s = state.borrow();
+            match s.find(id) {
+                Some(doc) => pdf_default_name(&doc.name),
+                None => return,
+            }
+        };
+        let target = match show_pdf_save_dialog(hwnd, &default_name) {
+            Some(path) => path,
+            None => {
+                if let Some(wv) = webview.borrow().as_ref() {
+                    let _ = wv.evaluate_script(
+                        "window.mdv && mdv.pdfExportFinished(false, '');",
+                    );
+                }
+                return;
+            }
+        };
+
+        let result = {
+            let borrowed = webview.borrow();
+            match borrowed.as_ref() {
+                Some(wv) => start_webview_pdf_export(wv, &target, proxy.clone()),
+                None => Err("WebView 不可用".to_string()),
+            }
+        };
+        if let Err(err) = result {
+            show_error(&format!("PDF 导出失败：\n\n{}", err));
+            if let Some(wv) = webview.borrow().as_ref() {
+                let _ = wv.evaluate_script(
+                    "window.mdv && mdv.pdfExportFinished(false, '');",
+                );
             }
         }
         return;
@@ -1681,6 +1782,124 @@ fn show_save_dialog(owner_hwnd: isize, default_name: &str) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(String::from_utf16_lossy(&buffer[..end])))
+}
+
+fn pdf_default_name(document_name: &str) -> String {
+    let stem = Path::new(document_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("document");
+    format!("{}.pdf", stem)
+}
+
+/// Show a native PDF Save-As dialog. WebView2's PrintToPdf API writes directly
+/// to this target, so users do not need to select a virtual PDF printer.
+fn show_pdf_save_dialog(owner_hwnd: isize, default_name: &str) -> Option<PathBuf> {
+    let mut buffer: Vec<u16> = vec![0u16; 32_768];
+    for (i, u) in default_name.encode_utf16().enumerate() {
+        if i + 1 >= buffer.len() {
+            break;
+        }
+        buffer[i] = u;
+    }
+
+    let mut filter: Vec<u16> = Vec::new();
+    for part in ["PDF 文件 (*.pdf)", "*.pdf", "所有文件 (*.*)", "*.*"] {
+        filter.extend(part.encode_utf16());
+        filter.push(0);
+    }
+    filter.push(0);
+
+    let title: Vec<u16> = "导出 PDF"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let def_ext: Vec<u16> = "pdf".encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut ofn = Ofnw {
+        l_struct_size: std::mem::size_of::<Ofnw>() as u32,
+        hwnd_owner: owner_hwnd,
+        h_instance: 0,
+        lp_str_filter: filter.as_ptr(),
+        lp_str_custom_filter: std::ptr::null_mut(),
+        n_max_cust_filter: 0,
+        n_filter_index: 1,
+        lp_str_file: buffer.as_mut_ptr(),
+        n_max_file: buffer.len() as u32,
+        lp_str_file_title: std::ptr::null_mut(),
+        n_max_file_title: 0,
+        lp_str_initial_dir: std::ptr::null(),
+        lp_str_title: title.as_ptr(),
+        // OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+        flags: 0x0008_0000 | 0x0000_0002 | 0x0000_0800 | 0x0000_0008,
+        n_file_offset: 0,
+        n_file_extension: 0,
+        lp_str_def_ext: def_ext.as_ptr(),
+        l_cust_data: 0,
+        lpfn_hook: 0,
+        lp_template_name: std::ptr::null(),
+        pv_reserved: std::ptr::null(),
+        dw_reserved: 0,
+        flags_ex: 0,
+    };
+
+    let ok = unsafe {
+        #[link(name = "comdlg32")]
+        extern "system" {
+            fn GetSaveFileNameW(ofn: *mut Ofnw) -> i32;
+        }
+        GetSaveFileNameW(&mut ofn)
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    if end == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..end])))
+}
+
+fn start_webview_pdf_export(
+    webview: &wry::WebView,
+    target: &Path,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Result<(), String> {
+    let controller = webview.controller();
+    let core = unsafe { controller.CoreWebView2() }.map_err(|e| e.to_string())?;
+    let core7: ICoreWebView2_7 = core.cast().map_err(|e| e.to_string())?;
+    let target_path = target.to_path_buf();
+    let target_wide: Vec<u16> = target
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handler = PrintToPdfCompletedHandler::create(Box::new(move |status, succeeded| {
+        let error = match status {
+            Err(err) => Some(err.to_string()),
+            Ok(()) if !succeeded => Some("WebView2 未能完成 PDF 写入".to_string()),
+            Ok(()) => None,
+        };
+        let _ = proxy.send_event(UserEvent::PdfExportFinished {
+            target: target_path,
+            error,
+        });
+        Ok(())
+    }));
+
+    unsafe {
+        core7
+            .PrintToPdf(
+                PCWSTR(target_wide.as_ptr()),
+                None::<&ICoreWebView2PrintSettings>,
+                &handler,
+            )
+            .map_err(|e| e.to_string())
+    }
 }
 
 fn detect_image_ext(data: &[u8]) -> &'static str {
@@ -2685,7 +2904,8 @@ body {{
 }}
 .tab-bar::-webkit-scrollbar {{ height: 0; display: none; }}
 .tab-bar.empty {{ display: none; }}
-.new-tab-btn {{
+.new-tab-btn,
+.export-pdf-btn {{
   flex: 0 0 auto;
   width: 34px;
   height: 100%;
@@ -2699,15 +2919,33 @@ body {{
   color: var(--fg-secondary);
   transition: background .12s, color .12s;
 }}
-.new-tab-btn:hover {{ background: var(--btn-hover); color: var(--fg); }}
-.new-tab-btn svg {{
+.export-pdf-btn {{ margin-left: auto; }}
+.new-tab-btn:hover,
+.export-pdf-btn:not(:disabled):hover {{ background: var(--btn-hover); color: var(--fg); }}
+.new-tab-btn svg,
+.export-pdf-btn svg {{
   width: 13px;
   height: 13px;
   stroke: currentColor;
   fill: none;
   stroke-width: 1.6;
   stroke-linecap: round;
+  stroke-linejoin: round;
 }}
+.export-pdf-btn svg {{ width: 21px; height: 21px; }}
+.export-pdf-btn .pdf-sheet {{ fill: none; stroke: currentColor; stroke-width: 1.5; }}
+.export-pdf-btn .pdf-badge {{ fill: #dc2626; stroke: none; }}
+.export-pdf-btn .pdf-label {{
+  fill: #fff;
+  stroke: none;
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-size: 5.4px;
+  font-weight: 800;
+  letter-spacing: .15px;
+}}
+.export-pdf-btn:disabled {{ cursor: default; opacity: .35; }}
+.export-pdf-btn.is-busy {{ color: var(--accent); opacity: .75; }}
+.export-pdf-btn.is-success {{ color: #16a34a; }}
 
 /* External-change banner: shown when a dirty tab's file is modified on disk. */
 .reload-banner {{
@@ -3747,10 +3985,16 @@ dd {{
 .mermaid-diagram.is-error {{
   border-left: 4px solid #ef4444;
 }}
+.mermaid-diagram.is-pending {{
+  border-left: 4px solid var(--accent);
+}}
 .mermaid-error-title {{
   margin-bottom: 0.5em;
   color: #ef4444;
   font-weight: 650;
+}}
+.mermaid-diagram.is-pending .mermaid-error-title {{
+  color: var(--fg-secondary);
 }}
 .mermaid-diagram.is-error pre {{
   display: block;
@@ -3825,10 +4069,25 @@ summary {{ cursor: pointer; font-weight: 600; }}
 
 .footnote-definition {{ font-size: 0.9em; color: var(--fg-secondary); }}
 
+@page {{ margin: 18mm; }}
 @media print {{
-  .titlebar {{ display: none !important; }}
-  body {{ background: #fff; color: #000; }}
-  .container {{ max-width: 100%; padding: 20px; }}
+  :root {{
+    --bg: #ffffff;
+    --fg: #111827;
+    --fg-secondary: #4b5563;
+    --border: #d1d5db;
+    --code-bg: #f6f8fc;
+    --block-bg: #f8f9fd;
+  }}
+  html, body {{ height: auto; overflow: visible; }}
+  body {{ display: block; background: #fff; color: #000; print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
+  body > * {{ display: none !important; }}
+  body > .content-area {{ display: block !important; min-height: 0; margin: 0; }}
+  .content-area > * {{ display: none !important; }}
+  .content-area > .main-scroll {{ display: block !important; overflow: visible !important; }}
+  .container {{ display: block !important; max-width: 100%; padding: 0; }}
+  .copy-btn {{ display: none !important; }}
+  img {{ break-inside: avoid; max-width: 100% !important; }}
   pre {{ box-shadow: none; border: 1px solid #ddd; }}
   .mermaid-diagram {{ max-height: none; overflow: visible; box-shadow: none; }}
   .mermaid-diagram svg {{ min-width: 0; max-width: 100% !important; }}
@@ -3859,6 +4118,14 @@ summary {{ cursor: pointer; font-weight: 600; }}
   <div class="tab-bar empty" id="tabBar"></div>
   <button class="new-tab-btn" id="newTabBtn" type="button" title="新建文档 (Ctrl+N)">
     <svg viewBox="0 0 14 14"><line x1="7" y1="2" x2="7" y2="12"/><line x1="2" y1="7" x2="12" y2="7"/></svg>
+  </button>
+  <button class="export-pdf-btn" id="exportPdfBtn" type="button" title="导出 PDF" aria-label="导出 PDF" disabled>
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path class="pdf-sheet" d="M6.5 2.5h7l4 4v15h-11z"/>
+      <path class="pdf-sheet" d="M13.5 2.5v4h4"/>
+      <rect class="pdf-badge" x="3" y="10" width="18" height="8.5" rx="2"/>
+      <text class="pdf-label" x="12" y="16.1" text-anchor="middle">PDF</text>
+    </svg>
   </button>
 </div>
 
@@ -4019,6 +4286,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 
   const tabBar = document.getElementById('tabBar');
   const newTabBtn = document.getElementById('newTabBtn');
+  const exportPdfBtn = document.getElementById('exportPdfBtn');
   const modeGroup = document.getElementById('modeGroup');
   const contentArea = document.getElementById('contentArea');
   const editorTA = document.getElementById('editorTextarea');
@@ -4040,6 +4308,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
   const updateBannerLater = document.getElementById('updateBannerLater');
   const updateBannerDo = document.getElementById('updateBannerDo');
   let updateAvailable = false;
+  let pdfExportInProgress = false;
+  let pdfExportSuccessTimer = null;
+  let pdfExportWatchdogTimer = null;
 
   function decB64(b64) {{
     if (!b64) return '';
@@ -4063,6 +4334,16 @@ summary {{ cursor: pointer; font-weight: 600; }}
 
   function updateWindowTitle(name) {{
     document.title = name ? (name + ' — MD Viewer') : 'MD Viewer';
+  }}
+
+  function updatePdfExportButton() {{
+    if (!exportPdfBtn) return;
+    exportPdfBtn.disabled = activeId === null || pdfExportInProgress;
+    exportPdfBtn.classList.toggle('is-busy', pdfExportInProgress);
+    exportPdfBtn.setAttribute('aria-busy', pdfExportInProgress ? 'true' : 'false');
+    if (!exportPdfBtn.classList.contains('is-success')) {{
+      exportPdfBtn.title = pdfExportInProgress ? '正在导出 PDF…' : '导出 PDF';
+    }}
   }}
 
   function renderTabBar() {{
@@ -4211,6 +4492,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
       const isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
       window.mermaid.initialize({{
         startOnLoad: false,
+        suppressErrorRendering: true,
         securityLevel: 'strict',
         theme: isDark ? 'dark' : 'default',
         flowchart: {{ useMaxWidth: false, htmlLabels: true }},
@@ -4218,6 +4500,28 @@ summary {{ cursor: pointer; font-weight: 600; }}
       mermaidInitialized = true;
     }}
     return true;
+  }}
+
+  function fillMermaidFallback(holder, diagramText, titleText, detail, isError) {{
+    holder.classList.add(isError ? 'is-error' : 'is-pending');
+    const title = document.createElement('div');
+    title.className = 'mermaid-error-title';
+    title.textContent = titleText;
+    if (detail) title.title = detail;
+    const fallback = document.createElement('pre');
+    fallback.textContent = diagramText;
+    holder.appendChild(title);
+    holder.appendChild(fallback);
+  }}
+
+  function cleanupMermaidRenderArtifacts(renderId) {{
+    if (!renderId) return;
+    // Mermaid renders into temporary body children named d<id>/i<id>. Older
+    // releases could leave those nodes behind when parsing or drawing failed.
+    for (const id of ['d' + renderId, 'i' + renderId]) {{
+      const artifact = document.getElementById(id);
+      if (artifact) artifact.remove();
+    }}
   }}
 
   async function renderMermaid(root, version) {{
@@ -4232,21 +4536,40 @@ summary {{ cursor: pointer; font-weight: 600; }}
       holder.className = 'mermaid-diagram';
 
       if (!rendererReady) {{
-        holder.classList.add('is-error');
-        const title = document.createElement('div');
-        title.className = 'mermaid-error-title';
-        title.textContent = 'Mermaid renderer is unavailable';
-        const fallback = document.createElement('pre');
-        fallback.textContent = diagramText;
-        holder.appendChild(title);
-        holder.appendChild(fallback);
+        fillMermaidFallback(holder, diagramText, 'Mermaid 渲染器不可用', '', true);
         source.replaceWith(holder);
         bindMermaidPan(holder);
         continue;
       }}
 
+      if (typeof window.mermaid.parse === 'function') {{
+        let syntaxValid = false;
+        try {{
+          syntaxValid = await window.mermaid.parse(diagramText, {{ suppressErrors: true }});
+        }} catch (_) {{
+          syntaxValid = false;
+        }}
+        if (version !== previewRenderVersion || !source.isConnected) return;
+        if (!syntaxValid) {{
+          const liveEditing = mode === 'split';
+          fillMermaidFallback(
+            holder,
+            diagramText,
+            liveEditing
+              ? 'Mermaid 图表语法尚未完整，继续编辑后会自动更新'
+              : 'Mermaid 图表语法错误',
+            '',
+            !liveEditing
+          );
+          source.replaceWith(holder);
+          bindMermaidPan(holder);
+          continue;
+        }}
+      }}
+
+      let renderId = '';
       try {{
-        const renderId = 'mdvMermaid' + Date.now() + '_' + (++mermaidSequence);
+        renderId = 'mdvMermaid' + Date.now() + '_' + (++mermaidSequence);
         const result = await window.mermaid.render(renderId, diagramText);
         if (version !== previewRenderVersion || !source.isConnected) return;
         holder.innerHTML = result.svg;
@@ -4254,15 +4577,19 @@ summary {{ cursor: pointer; font-weight: 600; }}
         bindMermaidPan(holder);
         if (typeof result.bindFunctions === 'function') result.bindFunctions(holder);
       }} catch (err) {{
+        cleanupMermaidRenderArtifacts(renderId);
         if (version !== previewRenderVersion || !source.isConnected) return;
-        holder.classList.add('is-error');
-        const title = document.createElement('div');
-        title.className = 'mermaid-error-title';
-        title.textContent = err && err.message ? err.message : 'Mermaid render error';
-        const fallback = document.createElement('pre');
-        fallback.textContent = diagramText;
-        holder.appendChild(title);
-        holder.appendChild(fallback);
+        const liveEditing = mode === 'split';
+        const detail = err && err.message ? err.message : 'Mermaid render error';
+        fillMermaidFallback(
+          holder,
+          diagramText,
+          liveEditing
+            ? 'Mermaid 图表尚未完成，继续编辑后会自动更新'
+            : 'Mermaid 图表渲染失败',
+          detail,
+          !liveEditing
+        );
         source.replaceWith(holder);
         bindMermaidPan(holder);
       }}
@@ -4278,7 +4605,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
   function renderAdvancedMarkdown(root, version) {{
     renderMath(root);
     root.querySelectorAll('.mermaid-diagram').forEach(bindMermaidPan);
-    renderMermaid(root, version).then(() => {{
+    return renderMermaid(root, version).then(() => {{
       if (version !== previewRenderVersion) return;
       if (mode === 'view') buildTOC();
       if (mode === 'split') highlightCursorBlock();
@@ -4295,10 +4622,11 @@ summary {{ cursor: pointer; font-weight: 600; }}
     const prev = preserveScroll ? mainScroll.scrollTop : 0;
     previewContainer.innerHTML = html;
     enhanceCodeBlocks(previewContainer);
-    renderAdvancedMarkdown(previewContainer, version);
+    const advancedRender = renderAdvancedMarkdown(previewContainer, version);
     if (mode === 'view') buildTOC();
     if (preserveScroll) mainScroll.scrollTop = prev;
     if (mode === 'split') highlightCursorBlock();
+    return advancedRender;
   }}
 
   // Cached version: take pre-enhanced HTML (already wrapped code blocks) and
@@ -4308,10 +4636,11 @@ summary {{ cursor: pointer; font-weight: 600; }}
     const prev = preserveScroll ? mainScroll.scrollTop : 0;
     previewContainer.innerHTML = cached;
     previewContainer.querySelectorAll('.code-wrapper').forEach(bindCopyButton);
-    renderAdvancedMarkdown(previewContainer, version);
+    const advancedRender = renderAdvancedMarkdown(previewContainer, version);
     if (mode === 'view') buildTOC();
     if (preserveScroll) mainScroll.scrollTop = prev;
     if (mode === 'split') highlightCursorBlock();
+    return advancedRender;
   }}
 
   function showEmptyState() {{
@@ -4325,11 +4654,13 @@ summary {{ cursor: pointer; font-weight: 600; }}
     updateWindowTitle(null);
     renderTabBar();
     updateReloadBanner();
+    updatePdfExportButton();
   }}
 
   function switchTo(id) {{
     const doc = docs.get(id);
     if (!doc) return;
+    if (renderTimer) {{ clearTimeout(renderTimer); renderTimer = null; }}
     activeId = id;
     if (!doc.isPreview) lastPermanentId = id;
     contentArea.classList.remove('no-doc');
@@ -4339,6 +4670,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     updateWindowTitle(doc.name);
     renderTabBar();
     updateReloadBanner();
+    updatePdfExportButton();
     if (editorTA.value !== doc.markdown) editorTA.value = doc.markdown;
     if (doc.enhancedHtml) {{
       setPreviewHtmlCached(doc.enhancedHtml, false);
@@ -4580,6 +4912,92 @@ summary {{ cursor: pointer; font-weight: 600; }}
     // host's write-complete callback).
     doc.pendingSaveSnapshot = doc.markdown;
     try {{ window.ipc.postMessage('save:' + activeId + ':' + encB64(doc.markdown)); }} catch(_) {{}}
+  }}
+
+  function requestPdfExport() {{
+    if (activeId === null || pdfExportInProgress) return;
+    const doc = docs.get(activeId);
+    if (!doc) return;
+    if (renderTimer) {{ clearTimeout(renderTimer); renderTimer = null; }}
+    if (pdfExportSuccessTimer) {{ clearTimeout(pdfExportSuccessTimer); pdfExportSuccessTimer = null; }}
+    exportPdfBtn.classList.remove('is-success');
+    pdfExportInProgress = true;
+    updatePdfExportButton();
+    if (pdfExportWatchdogTimer) clearTimeout(pdfExportWatchdogTimer);
+    pdfExportWatchdogTimer = setTimeout(() => {{
+      pdfExportWatchdogTimer = null;
+      if (pdfExportInProgress) pdfExportFinished(false, '');
+    }}, 30000);
+    try {{
+      window.ipc.postMessage('prepare-pdf-export:' + activeId + ':' + encB64(doc.markdown));
+    }} catch (_) {{
+      pdfExportFinished(false, '');
+    }}
+  }}
+
+  async function waitForPdfAssets() {{
+    const images = Array.from(previewContainer.querySelectorAll('img'));
+    const imageReady = Promise.all(images.map((img) => {{
+      if (img.complete) {{
+        return typeof img.decode === 'function' ? img.decode().catch(() => undefined) : Promise.resolve();
+      }}
+      return new Promise((resolve) => {{
+        img.addEventListener('load', resolve, {{ once: true }});
+        img.addEventListener('error', resolve, {{ once: true }});
+      }});
+    }}));
+    const fontReady = document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve();
+    await Promise.race([
+      Promise.all([imageReady, fontReady]),
+      new Promise((resolve) => setTimeout(resolve, 5000)),
+    ]);
+  }}
+
+  async function preparePdfExport(id, htmlB64) {{
+    if (activeId !== id || !pdfExportInProgress) {{
+      pdfExportFinished(false, '');
+      return;
+    }}
+    const doc = docs.get(id);
+    if (!doc) {{
+      pdfExportFinished(false, '');
+      return;
+    }}
+    const html = decB64(htmlB64);
+    doc.htmlBody = html;
+    doc.enhancedHtml = null;
+    doc.previewStale = false;
+    await setPreviewHtml(html, true);
+    await waitForPdfAssets();
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    if (activeId !== id || !docs.has(id) || !pdfExportInProgress) {{
+      pdfExportFinished(false, '');
+      return;
+    }}
+    try {{
+      window.ipc.postMessage('pdf-export-ready:' + id);
+    }} catch (_) {{
+      pdfExportFinished(false, '');
+    }}
+  }}
+
+  function pdfExportFinished(success, pathB64) {{
+    if (pdfExportWatchdogTimer) {{
+      clearTimeout(pdfExportWatchdogTimer);
+      pdfExportWatchdogTimer = null;
+    }}
+    pdfExportInProgress = false;
+    updatePdfExportButton();
+    if (!success || !exportPdfBtn) return;
+    let path = '';
+    try {{ path = decB64(pathB64); }} catch (_) {{}}
+    exportPdfBtn.classList.add('is-success');
+    exportPdfBtn.title = path ? ('PDF 已导出：' + path) : 'PDF 已导出';
+    pdfExportSuccessTimer = setTimeout(() => {{
+      pdfExportSuccessTimer = null;
+      exportPdfBtn.classList.remove('is-success');
+      updatePdfExportButton();
+    }}, 2400);
   }}
 
   function applyRender(id, htmlB64) {{
@@ -4914,6 +5332,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
   function setMode(m) {{
     closeFind();
     if (m !== 'view' && m !== 'edit' && m !== 'split') return;
+    if (renderTimer) {{ clearTimeout(renderTimer); renderTimer = null; }}
     mode = m;
     contentArea.classList.remove('mode-view', 'mode-edit', 'mode-split');
     contentArea.classList.add('mode-' + m);
@@ -5492,8 +5911,13 @@ summary {{ cursor: pointer; font-weight: 600; }}
     if (mode === 'split') {{
       highlightCursorBlock();
       if (renderTimer) clearTimeout(renderTimer);
+      const renderDocId = doc.id;
+      const markdownSnapshot = doc.markdown;
       renderTimer = setTimeout(() => {{
-        try {{ window.ipc.postMessage('render:' + activeId + ':' + encB64(doc.markdown)); }} catch(_) {{}}
+        renderTimer = null;
+        const currentDoc = docs.get(renderDocId);
+        if (!currentDoc || currentDoc.markdown !== markdownSnapshot) return;
+        try {{ window.ipc.postMessage('render:' + renderDocId + ':' + encB64(markdownSnapshot)); }} catch(_) {{}}
       }}, 350);
     }}
   }}
@@ -6024,6 +6448,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
   if (newTabBtn) {{
     newTabBtn.addEventListener('click', createNewDoc);
   }}
+  if (exportPdfBtn) {{
+    exportPdfBtn.addEventListener('click', requestPdfExport);
+  }}
 
   // Vertical mouse-wheel scrolls the tab strip horizontally (the scrollbar is
   // hidden, VS Code style), so overflowed tabs on the far left stay reachable.
@@ -6296,6 +6723,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
     addUntitled: addUntitled,
     replaceDoc: replaceDoc,
     applyRender: applyRender,
+    preparePdfExport: preparePdfExport,
+    pdfExportFinished: pdfExportFinished,
     externalReload: externalReload,
     applyFileTree: applyFileTree,
     pasteImageInserted: pasteImageInserted,
@@ -6412,7 +6841,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 
 #[cfg(test)]
 mod tests {
-    use super::render_markdown_body;
+    use super::{pdf_default_name, render_markdown_body, render_shell_page, AppState};
 
     #[test]
     fn mermaid_fence_is_emitted_as_diagram_source() {
@@ -6445,5 +6874,41 @@ mod tests {
         assert!(html.contains("footnote-reference"));
         assert!(html.contains("footnote-definition"));
         assert!(html.contains("Footnote body"));
+    }
+
+    #[test]
+    fn mermaid_live_preview_suppresses_library_error_svg() {
+        let shell = render_shell_page(&AppState::new(), None);
+        assert!(shell.contains("suppressErrorRendering: true"));
+        assert!(shell.contains("mermaid.parse(diagramText, { suppressErrors: true })"));
+        assert!(shell.contains("cleanupMermaidRenderArtifacts(renderId)"));
+    }
+
+    #[test]
+    fn split_render_debounce_keeps_document_identity_stable() {
+        let shell = render_shell_page(&AppState::new(), None);
+        assert!(shell.contains("const renderDocId = doc.id;"));
+        assert!(shell.contains("const markdownSnapshot = doc.markdown;"));
+        assert!(shell.contains("'render:' + renderDocId + ':' + encB64(markdownSnapshot)"));
+    }
+
+    #[test]
+    fn pdf_export_button_is_right_aligned_and_has_render_handshake() {
+        let shell = render_shell_page(&AppState::new(), None);
+        assert!(shell.contains("id=\"exportPdfBtn\""));
+        assert!(shell.contains(".export-pdf-btn { margin-left: auto; }"));
+        assert!(shell.contains("class=\"pdf-badge\""));
+        assert!(shell.contains(">PDF</text>"));
+        assert!(shell.contains("prepare-pdf-export:"));
+        assert!(shell.contains("pdf-export-ready:"));
+        assert!(shell.contains("pdfExportWatchdogTimer"));
+        assert!(shell.contains("body > .content-area { display: block !important;"));
+    }
+
+    #[test]
+    fn pdf_export_uses_document_stem_for_default_name() {
+        assert_eq!(pdf_default_name("架构图.md"), "架构图.pdf");
+        assert_eq!(pdf_default_name("未命名1"), "未命名1.pdf");
+        assert_eq!(pdf_default_name(""), "document.pdf");
     }
 }
